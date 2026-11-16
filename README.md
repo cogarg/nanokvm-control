@@ -100,6 +100,7 @@ list is relocated; WebKit there keeps one shared website data store.)
 ```
 ui/                    device-manager frontend (index.html, style.css, app.js)
 src-tauri/src/main.rs  Tauri commands, console tabs (multi-webview) and windows, auto-login script
+src-tauri/src/stream_watchdog.js  injected into consoles: restarts the MJPEG stream if no picture arrives
 src-tauri/src/store.rs device model + JSON persistence + address normalization
 src-tauri/src/crypto.rs NanoKVM password encoding (CryptoJS-compatible AES, as the web UI does)
 src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network prompt text
@@ -112,6 +113,11 @@ src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network pr
 - **Video (Linux):** the console uses the system WebKitGTK. If H.264/WebRTC mode doesn't play, switch the
   NanoKVM to MJPEG mode in its settings. On NVIDIA, a blank window may need
   `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
+- **Black console, working mouse (WebKit, MJPEG mode):** WebKit learns that the console page loads
+  the never-ending `/api/stream/mjpeg` and starts fetching it speculatively on later visits; the
+  page's own request then waits forever, and reloading doesn't help. The app turns off WebKitGTK's
+  disk cache (Linux), and `stream_watchdog.js` re-requests the stream under a fresh URL if no
+  picture shows within 4 s (all platforms). The same symptom in a regular browser has other causes.
 - **macOS shortcuts:** Cmd+Q / Cmd+W go to the app (quit / close the console window), not the remote machine.
 - **Console tabs use Tauri's `unstable` multi-webview API.** On Windows/macOS each tab is a native
   webview positioned under the tab bar; on Linux, where WebKitGTK can't position child webviews,

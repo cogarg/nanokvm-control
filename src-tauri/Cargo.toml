@@ -1,6 +1,6 @@
 [package]
 name = "nanokvm-control"
-version = "0.2.0"
+version = "0.3.0"
 description = "Desktop control center for Sipeed NanoKVM devices"
 edition = "2021"
 
@@ -28,3 +28,4 @@ custom-protocol = ["tauri/custom-protocol"]
 # Linux: console tabs are laid out with a GtkOverlay (see gtk_overlay in main.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+webkit2gtk = "2.0"

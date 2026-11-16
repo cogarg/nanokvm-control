@@ -219,6 +219,28 @@ fn autologin_script(d: &Device) -> Option<String> {
     ))
 }
 
+/// Script injected into every console webview: restarts the MJPEG stream if no picture arrives
+/// (see stream_watchdog.js for the WebKit behaviour it works around).
+fn stream_watchdog_script(d: &Device) -> Option<String> {
+    let origin = serde_json::to_string(&d.url).ok()?;
+    Some(include_str!("stream_watchdog.js").replace("__ORIGIN__", &origin))
+}
+
+/// Linux/WebKitGTK: turn off the disk cache of a webview's web context. With it on, WebKit
+/// learns that the console page loads `/api/stream/mjpeg` and later fetches it speculatively;
+/// the never-ending stream then starves the page's own request and the console stays black.
+/// The UI and all consoles share one context (same data directory), so calling this on the UI
+/// webview at startup covers every console before it loads.
+#[cfg(target_os = "linux")]
+fn disable_disk_cache(webview: &webkit2gtk::WebView) {
+    use webkit2gtk::{CacheModel, WebContextExt, WebViewExt};
+    if let Some(ctx) = webview.context() {
+        if ctx.cache_model() != CacheModel::DocumentViewer {
+            ctx.set_cache_model(CacheModel::DocumentViewer);
+        }
+    }
+}
+
 fn console_url(d: &Device) -> Result<WebviewUrl, String> {
     Ok(WebviewUrl::External(Url::parse(&d.url).map_err(|e| e.to_string())?))
 }
@@ -310,6 +332,9 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
         if let Some(script) = autologin_script(&d) {
             builder = builder.initialization_script(script);
         }
+        if let Some(script) = stream_watchdog_script(&d) {
+            builder = builder.initialization_script(script);
+        }
         let rect = bounds.rect();
         let webview = window
             .add_child(builder, rect.position, rect.size)
@@ -319,6 +344,7 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
             let top = bounds.y.round() as i32;
             let _ = webview.with_webview(move |p| {
                 use gtk::prelude::Cast;
+                disable_disk_cache(&p.inner());
                 gtk_overlay::adopt_console(p.inner().upcast(), top);
             });
         }
@@ -359,7 +385,14 @@ async fn open_window(app: AppHandle, state: State<'_, AppState>, id: String) -> 
     if let Some(script) = autologin_script(&d) {
         builder = builder.initialization_script(script);
     }
-    builder.build().map_err(|e| format!("Could not open console window: {e}"))?;
+    if let Some(script) = stream_watchdog_script(&d) {
+        builder = builder.initialization_script(script);
+    }
+    let window = builder.build().map_err(|e| format!("Could not open console window: {e}"))?;
+    #[cfg(target_os = "linux")]
+    let _ = window.with_webview(|p| disable_disk_cache(&p.inner()));
+    #[cfg(not(target_os = "linux"))]
+    let _ = window;
     Ok(())
 }
 
@@ -415,6 +448,7 @@ fn main() {
             #[cfg(target_os = "linux")]
             ui.with_webview(|p| {
                 use gtk::prelude::Cast;
+                disable_disk_cache(&p.inner());
                 gtk_overlay::install(p.inner().upcast());
             })?;
             #[cfg(not(target_os = "linux"))]
