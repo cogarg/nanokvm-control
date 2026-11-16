@@ -48,8 +48,13 @@ function render() {
       node.querySelector('.name').textContent = d.name;
       node.querySelector('.name').title = d.name;
       node.querySelector('.url').textContent = d.url;
-      node.querySelector('.meta').textContent =
-        d.autoLogin && d.username && d.hasPassword ? `Auto-login as ${d.username}` : 'Manual login';
+      const meta = node.querySelector('.meta');
+      if (!d.autoLogin) meta.textContent = 'Manual login';
+      else if (d.username && d.hasPassword) meta.textContent = `Auto-login as ${d.username}`;
+      else {
+        meta.textContent = `Auto-login is on, but the ${d.username ? 'password' : 'username'} is missing`;
+        meta.classList.add('warn');
+      }
       return node;
     })
   );
@@ -222,6 +227,7 @@ function openDialog(device) {
     fields.username.value = device.username;
     fields.autoLogin.checked = device.autoLogin;
   } else {
+    fields.username.value = 'admin'; // NanoKVM's default account
     fields.autoLogin.checked = true;
   }
   passwordHint.hidden = !(device && device.hasPassword);

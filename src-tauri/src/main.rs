@@ -175,13 +175,46 @@ fn autologin_script(d: &Device) -> Option<String> {
     headers: {{ 'Content-Type': 'application/json' }},
     body: {body}
   }})
-    .then(function (r) {{ return r.json().then(function (j) {{ return {{ ok: r.ok, j: j }}; }}); }})
-    .then(function (res) {{
-      var failed = !res.ok || (res.j && typeof res.j.code === 'number' && res.j.code !== 0);
-      if (failed) {{ console.warn('[NanoKVM Control] auto-login failed', res.j); return; }}
-      location.replace(location.origin + '/');
+    .then(function (r) {{
+      return r.json().catch(function () {{ return null; }})
+        .then(function (j) {{ return {{ ok: r.ok, status: r.status, j: j }}; }});
     }})
-    .catch(function (e) {{ console.warn('[NanoKVM Control] auto-login error', e); }});
+    .then(function (res) {{
+      var code = res.j && typeof res.j.code === 'number' ? res.j.code : null;
+      if (res.ok && (code === null || code === 0)) {{ location.replace(location.origin + '/'); return; }}
+      var reasons = {{
+        '-2': 'the saved username or password is wrong',
+        '-4': 'the NanoKVM has temporarily locked all logins after too many failed attempts',
+        '-5': 'this account is temporarily locked after too many failed attempts'
+      }};
+      fail(reasons[String(code)] || ('the NanoKVM answered: ' + ((res.j && res.j.msg) || ('HTTP ' + res.status))));
+    }})
+    .catch(function (e) {{ fail('the login request failed (' + e + ')'); }});
+
+  // Tell the user instead of failing silently; the banner sits above the NanoKVM page.
+  function fail(reason) {{
+    console.warn('[NanoKVM Control] auto-login failed: ' + reason);
+    function show() {{
+      var bar = document.createElement('div');
+      bar.setAttribute('role', 'alert');
+      bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;gap:12px;' +
+        'align-items:center;padding:10px 16px;background:#7a271a;color:#fff;font:14px/1.4 system-ui,sans-serif;' +
+        'box-shadow:0 2px 8px rgba(0,0,0,.35)';
+      var text = document.createElement('span');
+      text.style.flex = '1';
+      text.textContent = 'NanoKVM Control could not log in automatically: ' + reason +
+        '. Log in below, or fix the saved credentials with Edit on the device card.';
+      var close = document.createElement('button');
+      close.textContent = 'Dismiss';
+      close.style.cssText = 'font:inherit;color:#fff;background:transparent;border:1px solid rgba(255,255,255,.6);' +
+        'border-radius:6px;padding:4px 10px;cursor:pointer';
+      close.onclick = function () {{ bar.remove(); }};
+      bar.appendChild(text);
+      bar.appendChild(close);
+      document.body.appendChild(bar);
+    }}
+    if (document.body) show(); else document.addEventListener('DOMContentLoaded', show);
+  }}
 }})();"#
     ))
 }
