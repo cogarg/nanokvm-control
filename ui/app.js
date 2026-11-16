@@ -6,12 +6,17 @@ const $ = (sel) => document.querySelector(sel);
 const listEl = $('#devices');
 const emptyEl = $('#empty');
 const errorEl = $('#error');
+const homeEl = $('#home');
+const placeholderEl = $('#placeholder');
+const tabsEl = $('#tabs');
+const homeTab = $('#home-tab');
 const dialog = $('#dialog');
 const form = $('#form');
 const fields = form.elements;
 const formError = $('#form-error');
 const passwordHint = $('#password-hint');
 const cardTpl = $('#card');
+const tabTpl = $('#tab');
 const confirmDlg = $('#confirm');
 
 const POLL_MS = 15000;
@@ -20,10 +25,19 @@ const status = new Map(); // id -> 'online' | 'offline' | 'unknown'
 let editingId = null;
 let clearPassword = false;
 
+// Console tabs, in display order. The native webviews live in Rust; this is the UI's view of them.
+let tabs = []; // [id]
+let active = null; // device id of the visible tab, or null for the device list
+
+const deviceById = (id) => devices.find((d) => d.id === id);
+const statusTitle = { online: 'Online', offline: 'Unreachable', unknown: 'Checking…' };
+
 function showError(el, msg) {
   el.textContent = msg || '';
   el.hidden = !msg;
 }
+
+// ---------------------------------------------------------------- device list
 
 function render() {
   emptyEl.hidden = devices.length > 0;
@@ -36,16 +50,20 @@ function render() {
       node.querySelector('.url').textContent = d.url;
       node.querySelector('.meta').textContent =
         d.autoLogin && d.username && d.hasPassword ? `Auto-login as ${d.username}` : 'Manual login';
-      setDot(node, status.get(d.id) || 'unknown');
       return node;
     })
   );
+  renderStatus();
 }
 
-function setDot(card, s) {
-  const dot = card.querySelector('.dot');
-  dot.dataset.status = s;
-  dot.title = { online: 'Online', offline: 'Unreachable', unknown: 'Checking…' }[s];
+function renderStatus() {
+  document.querySelectorAll('[data-id]').forEach((el) => {
+    const dot = el.querySelector('.dot');
+    if (!dot) return;
+    const s = status.get(el.dataset.id) || 'unknown';
+    dot.dataset.status = s;
+    dot.title = statusTitle[s];
+  });
 }
 
 async function load() {
@@ -56,7 +74,11 @@ async function load() {
   } catch (e) {
     showError(errorEl, String(e));
   }
+  // Drop tabs for devices that no longer exist; refresh names of the rest.
+  tabs = tabs.filter((id) => deviceById(id));
+  if (active && !deviceById(active)) active = null;
   render();
+  renderTabs();
   checkAll();
 }
 
@@ -66,13 +88,115 @@ async function check(id) {
   } catch {
     status.set(id, 'offline');
   }
-  const card = listEl.querySelector(`[data-id="${CSS.escape(id)}"]`);
-  if (card) setDot(card, status.get(id));
+  renderStatus();
 }
 
 function checkAll() {
   return Promise.all(devices.map((d) => check(d.id)));
 }
+
+// ---------------------------------------------------------------- tabs
+
+function renderTabs() {
+  homeTab.setAttribute('aria-selected', String(active === null));
+  tabsEl.replaceChildren(
+    ...tabs.map((id) => {
+      const d = deviceById(id);
+      const node = tabTpl.content.firstElementChild.cloneNode(true);
+      node.dataset.id = id;
+      node.title = `${d.name} — ${d.url}`;
+      node.querySelector('.tab-name').textContent = d.name;
+      node.setAttribute('aria-selected', String(active === id));
+      return node;
+    })
+  );
+  homeEl.hidden = active !== null;
+  placeholderEl.hidden = active === null;
+  renderStatus();
+  tabsEl.querySelector('[aria-selected="true"]')?.scrollIntoView({ inline: 'nearest' });
+}
+
+async function activate(id) {
+  active = id;
+  renderTabs();
+  try {
+    await invoke('show_tab', { id });
+  } catch (e) {
+    showError(errorEl, String(e));
+  }
+}
+
+async function connect(id) {
+  const d = deviceById(id);
+  try {
+    const where = await invoke('open_tab', { id });
+    if (where === 'window') return; // already popped out: its window was focused
+    if (!tabs.includes(id)) tabs.push(id);
+    showError(errorEl, '');
+    active = id;
+    renderTabs();
+  } catch (e) {
+    showError(errorEl, `${d.name}: ${e}`);
+  }
+}
+
+function forgetTab(id) {
+  const idx = tabs.indexOf(id);
+  if (idx === -1) return false;
+  tabs.splice(idx, 1);
+  if (active === id) return tabs[Math.min(idx, tabs.length - 1)] ?? null; // neighbour to show next
+  return active;
+}
+
+async function closeTab(id) {
+  if (!tabs.includes(id)) return;
+  const next = forgetTab(id);
+  await invoke('close_tab', { id });
+  await activate(next);
+}
+
+async function openWindow(id) {
+  const d = deviceById(id);
+  const hadTab = tabs.includes(id);
+  const next = hadTab ? forgetTab(id) : active;
+  try {
+    await invoke('open_window', { id });
+  } catch (e) {
+    showError(errorEl, `${d.name}: ${e}`);
+  }
+  if (hadTab) await activate(next);
+}
+
+homeTab.addEventListener('click', () => activate(null));
+
+tabsEl.addEventListener('click', (ev) => {
+  const tab = ev.target.closest('.tab');
+  if (!tab) return;
+  const id = tab.dataset.id;
+  const action = ev.target.closest('[data-tab-action]')?.dataset.tabAction;
+  if (action === 'close') return closeTab(id);
+  if (action === 'popout') return openWindow(id);
+  if (active !== id) activate(id);
+});
+// Middle-click closes a tab, like a browser.
+tabsEl.addEventListener('auxclick', (ev) => {
+  const tab = ev.target.closest('.tab');
+  if (tab && ev.button === 1) closeTab(tab.dataset.id);
+});
+
+// Console webviews are drawn natively below the tab bar; keep Rust in sync with that area.
+// Measured from the tab bar and the viewport, so it is right whichever view is showing.
+const tabbarEl = $('.tabbar');
+function reportBounds() {
+  const top = tabbarEl.getBoundingClientRect().bottom;
+  invoke('set_console_bounds', {
+    bounds: { x: 0, y: top, width: window.innerWidth, height: Math.max(0, window.innerHeight - top) },
+  }).catch(() => {});
+}
+new ResizeObserver(reportBounds).observe(tabbarEl);
+window.addEventListener('resize', reportBounds);
+
+// ---------------------------------------------------------------- dialogs
 
 // In-app replacement for window.confirm(), which native webviews don't all implement.
 function confirmDialog(title, message) {
@@ -139,53 +263,58 @@ $('#clear-password').addEventListener('click', () => {
 $('#cancel').addEventListener('click', () => dialog.close());
 $('#add').addEventListener('click', () => openDialog(null));
 $('#refresh').addEventListener('click', async (ev) => {
-  ev.currentTarget.disabled = true;
+  const btn = ev.currentTarget;
+  btn.disabled = true;
   devices.forEach((d) => status.set(d.id, 'unknown'));
-  render();
+  renderStatus();
   await checkAll();
-  ev.currentTarget.disabled = false;
+  btn.disabled = false;
 });
 
-document.addEventListener('click', async (ev) => {
+// ---------------------------------------------------------------- card actions
+
+listEl.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('button[data-action]');
   if (!btn) return;
-  const action = btn.dataset.action;
-  if (action === 'add') return openDialog(null);
-
   const id = btn.closest('.card')?.dataset.id;
-  const device = devices.find((d) => d.id === id);
+  const device = deviceById(id);
   if (!device) return;
 
-  if (action === 'edit') return openDialog(device);
-
-  if (action === 'delete') {
-    const ok = await confirmDialog(
-      `Delete "${device.name}"?`,
-      'Its address and saved login will be removed. An open console window for it will close.'
-    );
-    if (!ok) return;
-    try {
-      await invoke('delete_device', { id });
-      status.delete(id);
-      await load();
-    } catch (e) {
-      showError(errorEl, String(e));
-    }
-    return;
-  }
-
-  if (action === 'connect') {
-    btn.disabled = true;
-    try {
-      await invoke('connect_device', { id });
-      showError(errorEl, '');
-    } catch (e) {
-      showError(errorEl, `${device.name}: ${e}`);
-    } finally {
+  switch (btn.dataset.action) {
+    case 'connect':
+      btn.disabled = true;
+      await connect(id);
       btn.disabled = false;
+      break;
+    case 'window':
+      btn.disabled = true;
+      await openWindow(id);
+      btn.disabled = false;
+      break;
+    case 'edit':
+      openDialog(device);
+      break;
+    case 'delete': {
+      const ok = await confirmDialog(
+        `Delete "${device.name}"?`,
+        'Its address and saved login will be removed. Its open console tab or window will close.'
+      );
+      if (!ok) return;
+      try {
+        await invoke('delete_device', { id });
+        status.delete(id);
+        await load();
+      } catch (e) {
+        showError(errorEl, String(e));
+      }
+      break;
     }
   }
+});
+emptyEl.addEventListener('click', (ev) => {
+  if (ev.target.closest('[data-action="add"]')) openDialog(null);
 });
 
 setInterval(checkAll, POLL_MS);
+reportBounds();
 load();

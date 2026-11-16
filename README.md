@@ -1,16 +1,20 @@
 # nanokvm-control
 
 Control center for [Sipeed NanoKVM](https://github.com/sipeed/NanoKVM) devices: a small Tauri v2
-desktop app that keeps a list of your NanoKVMs, shows whether each is reachable, and opens each
-device's console in its own native window, optionally logging you in automatically.
+desktop app that keeps a list of your NanoKVMs, shows whether each is reachable, and opens their
+consoles in tabs or separate windows, optionally logging you in automatically.
 
 ## Features
 
 - Add / edit / delete devices (name, address, optional credentials)
 - Online/offline status, polled every 15 s
-- **Connect** opens the device's web console in a dedicated window (one per device; reconnecting focuses it)
-- Auto-login: the app performs the NanoKVM login from inside the console window, so the session cookie is set exactly as if you had logged in by hand
-- Console windows run the remote page with **no** access to the app's IPC
+- **Connect** opens the device's console in a **tab** of the main window; switch with the tab bar,
+  close with × or middle-click
+- **Open in new window** (the ↗ button on a device card or tab) pops a console out into its own
+  window; Connect on a popped-out device focuses that window instead of opening a duplicate tab
+- Auto-login: the app performs the NanoKVM login from inside the console itself, so the session
+  cookie is set exactly as if you had logged in by hand
+- Consoles (tabs and windows) run the remote page with **no** access to the app's IPC
 
 ## Platforms
 
@@ -81,7 +85,7 @@ will show "unknown publisher". Signing needs an Apple Developer ID / Windows cod
 
 ```
 ui/                    device-manager frontend (index.html, style.css, app.js)
-src-tauri/src/main.rs  Tauri commands: list/save/delete/check/connect, console windows, auto-login script
+src-tauri/src/main.rs  Tauri commands, console tabs (multi-webview) and windows, auto-login script
 src-tauri/src/store.rs device model + JSON persistence + address normalization
 src-tauri/src/crypto.rs NanoKVM password encoding (CryptoJS-compatible AES, as the web UI does)
 src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network prompt text
@@ -95,3 +99,7 @@ src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network pr
   NanoKVM to MJPEG mode in its settings. On NVIDIA, a blank window may need
   `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
 - **macOS shortcuts:** Cmd+Q / Cmd+W go to the app (quit / close the console window), not the remote machine.
+- **Console tabs use Tauri's `unstable` multi-webview API.** On Windows/macOS each tab is a native
+  webview positioned under the tab bar; on Linux, where WebKitGTK can't position child webviews,
+  the window's webviews are rearranged into a `GtkOverlay` (see `gtk_overlay` in `main.rs`).
+  `Cargo.lock` pins Tauri; re-test tabs after upgrading it, as this API may change.
