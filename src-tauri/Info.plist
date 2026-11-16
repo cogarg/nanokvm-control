@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged by Tauri into the macOS app bundle's Info.plist. -->
+<plist version="1.0">
+<dict>
+  <!-- NanoKVMs usually serve plain HTTP on the LAN; let console windows load it for any hostname. -->
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsArbitraryLoadsInWebContent</key>
+    <true/>
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+  </dict>
+  <!-- Text for the macOS "Local Network" permission prompt. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>NanoKVM Control connects to NanoKVM devices on your local network to check their status and open their consoles.</string>
+</dict>
+</plist>

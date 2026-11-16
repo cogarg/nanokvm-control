@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "IPC access for the device manager window only. KVM console windows load remote pages and get no IPC access.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
