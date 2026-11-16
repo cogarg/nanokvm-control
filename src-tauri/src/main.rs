@@ -4,7 +4,7 @@ mod crypto;
 mod store;
 
 use serde::{Deserialize, Serialize};
-use std::{sync::Mutex, time::Duration};
+use std::{path::PathBuf, sync::Mutex, time::Duration};
 use store::{Device, DeviceInput, DeviceView, Store};
 use tauri::{
     webview::WebviewBuilder, window::WindowBuilder, AppHandle, LogicalPosition, LogicalSize, Manager, Rect,
@@ -12,6 +12,8 @@ use tauri::{
 };
 
 const MAIN_WINDOW: &str = "main";
+/// Overrides where the app keeps its data (device list + webview cookies/storage).
+const DATA_DIR_ENV: &str = "NANOKVM_CONTROL_DATA_DIR";
 const UI_WEBVIEW: &str = "ui";
 
 /// Area (logical px, relative to the main window) where console tabs are drawn.
@@ -37,6 +39,44 @@ struct AppState {
     store: Mutex<Store>,
     http: reqwest::Client,
     bounds: Mutex<ConsoleBounds>,
+    /// Webview data directory (cookies, storage) when isolated; `None` uses the platform default.
+    webview_data: Option<PathBuf>,
+}
+
+/// Where the app keeps its data. Release builds use the normal per-user app directories.
+/// `NANOKVM_CONTROL_DATA_DIR` (any build) or a debug build (`cargo run`) instead keeps
+/// everything under one separate folder, so development and testing never touch the device
+/// list or console sessions of the installed app.
+struct DataLocation {
+    devices_file: PathBuf,
+    webview_data: Option<PathBuf>,
+    /// Set when the location is not the default, to make that visible in the window title.
+    isolated_root: Option<PathBuf>,
+}
+
+fn data_location(app: &tauri::App) -> tauri::Result<DataLocation> {
+    let config_dir = app.path().app_config_dir()?;
+    let root = match std::env::var_os(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None if cfg!(debug_assertions) => {
+            let mut name = config_dir.file_name().unwrap_or_default().to_os_string();
+            name.push(".dev");
+            Some(config_dir.with_file_name(name))
+        }
+        None => None,
+    };
+    Ok(match root {
+        Some(root) => DataLocation {
+            devices_file: root.join("devices.json"),
+            webview_data: Some(root.join("webview")),
+            isolated_root: Some(root),
+        },
+        None => DataLocation {
+            devices_file: config_dir.join("devices.json"),
+            webview_data: None,
+            isolated_root: None,
+        },
+    })
 }
 
 /// Where a device's console ended up after a connect request.
@@ -231,6 +271,9 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
         let window = app.get_window(MAIN_WINDOW).ok_or("Main window is gone")?;
         let bounds = *state.bounds.lock().unwrap();
         let mut builder = WebviewBuilder::new(tab_label(&id), console_url(&d)?);
+        if let Some(dir) = &state.webview_data {
+            builder = builder.data_directory(dir.clone());
+        }
         if let Some(script) = autologin_script(&d) {
             builder = builder.initialization_script(script);
         }
@@ -277,6 +320,9 @@ async fn open_window(app: AppHandle, state: State<'_, AppState>, id: String) -> 
         .title(format!("{} — NanoKVM", d.name))
         .inner_size(1280.0, 800.0)
         .min_inner_size(640.0, 400.0);
+    if let Some(dir) = &state.webview_data {
+        builder = builder.data_directory(dir.clone());
+    }
     if let Some(script) = autologin_script(&d) {
         builder = builder.initialization_script(script);
     }
@@ -303,31 +349,36 @@ fn set_console_bounds(app: AppHandle, state: State<AppState>, bounds: ConsoleBou
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
-            let path = app.path().app_config_dir()?.join("devices.json");
+            let location = data_location(app)?;
             let http = reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 // NanoKVM's optional HTTPS mode uses a self-signed certificate.
                 .danger_accept_invalid_certs(true)
                 .build()?;
             app.manage(AppState {
-                store: Mutex::new(Store::load(path)),
+                store: Mutex::new(Store::load(location.devices_file)),
                 http,
                 bounds: Mutex::new(ConsoleBounds { x: 0.0, y: 44.0, width: 1280.0, height: 776.0 }),
+                webview_data: location.webview_data.clone(),
             });
+            let title = match &location.isolated_root {
+                Some(root) => format!("NanoKVM Control — data: {}", root.display()),
+                None => "NanoKVM Control".to_string(),
+            };
 
             // A plain window hosting several webviews: the UI fills it, console tabs sit on top
             // of the area below the UI's tab bar.
             let window = WindowBuilder::new(app, MAIN_WINDOW)
-                .title("NanoKVM Control")
+                .title(title)
                 .inner_size(1280.0, 820.0)
                 .min_inner_size(640.0, 420.0)
                 .build()?;
             let size = window.inner_size()?.to_logical::<f64>(window.scale_factor()?);
-            let ui = window.add_child(
-                WebviewBuilder::new(UI_WEBVIEW, WebviewUrl::App("index.html".into())).auto_resize(),
-                LogicalPosition::new(0.0, 0.0),
-                size,
-            )?;
+            let mut ui_builder = WebviewBuilder::new(UI_WEBVIEW, WebviewUrl::App("index.html".into())).auto_resize();
+            if let Some(dir) = location.webview_data {
+                ui_builder = ui_builder.data_directory(dir);
+            }
+            let ui = window.add_child(ui_builder, LogicalPosition::new(0.0, 0.0), size)?;
             #[cfg(target_os = "linux")]
             ui.with_webview(|p| {
                 use gtk::prelude::Cast;

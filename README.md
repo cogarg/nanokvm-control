@@ -81,6 +81,20 @@ will show "unknown publisher". Signing needs an Apple Developer ID / Windows cod
 
 **Passwords are stored in plain text in that file**, so treat it like an SSH config.
 
+### Separate data for development and testing
+
+Development builds never touch the installed app's data:
+
+- **Debug builds** (`cargo run`, `cargo build`) keep the device list *and* webview data (cookies,
+  sessions) in a separate folder next to the normal one, e.g.
+  `~/.config/io.github.cogarg.nanokvm-control.dev/`.
+- **`NANOKVM_CONTROL_DATA_DIR=/some/dir`** puts all of it under that folder instead, in any build,
+  which is handy for throwaway test runs:
+  `NANOKVM_CONTROL_DATA_DIR=$(mktemp -d) cargo run`
+
+Whenever a non-default location is in use, the window title shows it. (On macOS only the device
+list is relocated; WebKit there keeps one shared website data store.)
+
 ## Layout
 
 ```
