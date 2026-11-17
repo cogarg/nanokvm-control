@@ -2,10 +2,17 @@
 
 mod crypto;
 mod ikvm;
+mod proxmox;
+mod relay;
 mod store;
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use store::{Device, DeviceInput, DeviceKind, DeviceView, Store};
 use tauri::{
     webview::WebviewBuilder, window::WindowBuilder, AppHandle, LogicalPosition, LogicalSize, Manager, Rect,
@@ -41,8 +48,12 @@ struct AppState {
     http: reqwest::Client,
     /// For BMC web UIs (longer timeout, no redirects).
     bmc_http: reqwest::Client,
-    /// iKVM relays of open Supermicro consoles, by webview/window label.
-    relays: Mutex<HashMap<String, ikvm::Relay>>,
+    /// Relays of open Supermicro / Proxmox consoles, by webview/window label.
+    relays: Mutex<HashMap<String, relay::Relay>>,
+    /// Proxmox login tickets.
+    pve_sessions: Arc<proxmox::Sessions>,
+    /// Names of Proxmox guests from the last listing, by console id (for window titles).
+    guest_names: Mutex<HashMap<String, String>>,
     bounds: Mutex<ConsoleBounds>,
     /// Webview data directory (cookies, storage) when isolated; `None` uses the platform default.
     webview_data: Option<PathBuf>,
@@ -250,19 +261,86 @@ fn console_url(d: &Device) -> Result<WebviewUrl, String> {
     Ok(WebviewUrl::External(Url::parse(&d.url).map_err(|e| e.to_string())?))
 }
 
-/// What a console webview loads and which scripts it gets, per device kind.
+/// What a console webview loads and which scripts it gets.
 struct ConsoleSpec {
     url: WebviewUrl,
     scripts: Vec<String>,
+    /// Window title for pop-out windows.
+    title: String,
 }
 
-/// NanoKVM: its own web UI, plus auto-login and the stream watchdog. Supermicro: the bundled
-/// noVNC-iKVM page (ui/ikvm), talking to a relay started for this console (`label`).
-async fn console_spec(state: &AppState, d: &Device, label: &str) -> Result<ConsoleSpec, String> {
+/// Console ids are device ids, or `pve:<server id>:<node>:<qemu|lxc>:<vmid>` for Proxmox guests.
+const GUEST_PREFIX: &str = "pve:";
+
+fn guest_id(server: &str, g: &proxmox::Guest) -> String {
+    format!("{GUEST_PREFIX}{server}:{}:{}:{}", g.node, g.kind, g.vmid)
+}
+
+fn parse_guest_id(id: &str) -> Option<(String, proxmox::Target)> {
+    let mut parts = id.strip_prefix(GUEST_PREFIX)?.split(':');
+    let (server, node, kind, vmid) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || !matches!(kind, "qemu" | "lxc") {
+        return None;
+    }
+    Some((server.to_string(), proxmox::Target { node: node.into(), kind: kind.into(), vmid: vmid.parse().ok()? }))
+}
+
+fn pve_server(d: &Device) -> proxmox::Server {
+    proxmox::Server {
+        base: d.url.clone(),
+        username: d.username.clone(),
+        password: d.password.clone(),
+        fingerprint: Some(d.tls_fingerprint.clone()).filter(|f| !f.is_empty()),
+    }
+}
+
+/// Pins a Proxmox server's certificate the first time it is seen.
+fn pin_callback(app: &AppHandle, server_id: &str) -> Arc<dyn Fn(String) + Send + Sync> {
+    let (app, id) = (app.clone(), server_id.to_string());
+    Arc::new(move |fp| app.state::<AppState>().store.lock().unwrap().pin_fingerprint(&id, &fp))
+}
+
+fn vnc_page(relay: &relay::Relay, name: &str) -> String {
+    let config = serde_json::json!({ "port": relay.port, "token": relay.token, "name": name });
+    format!("window.__NKC_VNC = {config};")
+}
+
+/// NanoKVM: its own web UI, plus auto-login and the stream watchdog. Supermicro and Proxmox: the
+/// bundled noVNC page (ui/vnc), talking to a relay started for this console (`label`).
+async fn console_spec(app: &AppHandle, state: &AppState, id: &str, label: &str) -> Result<ConsoleSpec, String> {
+    if let Some((server_id, target)) = parse_guest_id(id) {
+        let server = device(state, &server_id)?;
+        if server.username.is_empty() || server.password.is_empty() {
+            return Err("Save the Proxmox username and password first (Edit)".into());
+        }
+        let name = state
+            .guest_names
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| format!("{} {}", if target.kind == "lxc" { "CT" } else { "VM" }, target.vmid));
+        let relay = proxmox::start_console_relay(
+            pve_server(&server),
+            state.pve_sessions.clone(),
+            target,
+            pin_callback(app, &server_id),
+        )
+        .await?;
+        let script = vnc_page(&relay, &name);
+        state.relays.lock().unwrap().insert(label.to_string(), relay);
+        return Ok(ConsoleSpec {
+            url: WebviewUrl::App("vnc/index.html".into()),
+            scripts: vec![script],
+            title: format!("{name} — {}", server.name),
+        });
+    }
+    let d = device(state, id)?;
     match d.kind {
         DeviceKind::Nanokvm => Ok(ConsoleSpec {
-            url: console_url(d)?,
-            scripts: [autologin_script(d), stream_watchdog_script(d)].into_iter().flatten().collect(),
+            url: console_url(&d)?,
+            scripts: [autologin_script(&d), stream_watchdog_script(&d)].into_iter().flatten().collect(),
+            title: format!("{} — NanoKVM", d.name),
         }),
         DeviceKind::SupermicroIkvm => {
             if d.username.is_empty() || d.password.is_empty() {
@@ -272,17 +350,19 @@ async fn console_spec(state: &AppState, d: &Device, label: &str) -> Result<Conso
             let host = url.host_str().ok_or("The address has no host")?.to_string();
             let bmc = ikvm::Bmc { base: d.url.clone(), username: d.username.clone(), password: d.password.clone() };
             let relay = ikvm::start_relay(state.bmc_http.clone(), bmc, host).await?;
-            let config = serde_json::json!({ "port": relay.port, "token": relay.token, "name": d.name });
+            let script = vnc_page(&relay, &d.name);
             state.relays.lock().unwrap().insert(label.to_string(), relay);
             Ok(ConsoleSpec {
-                url: WebviewUrl::App("ikvm/index.html".into()),
-                scripts: vec![format!("window.__NKC_IKVM = {config};")],
+                url: WebviewUrl::App("vnc/index.html".into()),
+                scripts: vec![script],
+                title: format!("{} — iKVM", d.name),
             })
         }
+        DeviceKind::Proxmox => Err("A Proxmox server has no console of its own; connect to one of its VMs".into()),
     }
 }
 
-/// Stops the iKVM relay of a console, if it had one.
+/// Stops the relay of a console, if it had one.
 fn stop_relay(app: &AppHandle, label: &str) {
     app.state::<AppState>().relays.lock().unwrap().remove(label);
 }
@@ -341,12 +421,54 @@ fn save_device(state: State<AppState>, input: DeviceInput) -> Result<DeviceView,
 
 #[tauri::command]
 fn delete_device(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    close_tab_webview(&app, &id);
-    if let Some(w) = app.get_webview_window(&window_label(&id)) {
-        let _ = w.close();
+    // Its own console, and (for a Proxmox server) its guests' consoles.
+    let guests = format!("{GUEST_PREFIX}{id}:");
+    let mut ids = vec![id.clone()];
+    for label in app.webviews().into_keys() {
+        let console = label.strip_prefix("tab-").or_else(|| label.strip_prefix("kvm-"));
+        if let Some(c) = console.filter(|c| c.starts_with(&guests)) {
+            ids.push(c.to_string());
+        }
     }
-    stop_relay(&app, &window_label(&id));
+    for c in ids {
+        close_tab_webview(&app, &c);
+        if let Some(w) = app.get_webview_window(&window_label(&c)) {
+            let _ = w.close();
+        }
+        stop_relay(&app, &window_label(&c));
+    }
     state.store.lock().unwrap().delete(&id)
+}
+
+/// A Proxmox guest as the UI shows it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GuestView {
+    id: String,
+    #[serde(flatten)]
+    guest: proxmox::Guest,
+}
+
+/// Lists a Proxmox server's VMs and containers (templates left out).
+#[tauri::command]
+async fn list_guests(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<Vec<GuestView>, String> {
+    let server = device(&state, &id)?;
+    if server.kind != DeviceKind::Proxmox {
+        return Err("Not a Proxmox server".into());
+    }
+    if server.username.is_empty() || server.password.is_empty() {
+        return Err("Save the Proxmox username and password first (Edit)".into());
+    }
+    let reply = proxmox::list_guests(&pve_server(&server), &state.pve_sessions).await;
+    if let Some(fp) = reply.fingerprint {
+        pin_callback(&app, &id)(fp);
+    }
+    let guests: Vec<GuestView> =
+        reply.result?.into_iter().map(|g| GuestView { id: guest_id(&id, &g), guest: g }).collect();
+    let mut names = state.guest_names.lock().unwrap();
+    names.retain(|k, _| !k.starts_with(&format!("{GUEST_PREFIX}{id}:")));
+    names.extend(guests.iter().map(|g| (g.id.clone(), g.guest.name.clone())));
+    Ok(guests)
 }
 
 /// Reachability check: any HTTP response from the device counts as online.
@@ -357,6 +479,11 @@ async fn check_device(state: State<'_, AppState>, id: String) -> Result<bool, St
         DeviceKind::Nanokvm => &state.http,
         // Older BMCs need the system TLS library (see ikvm::http_client); keep the short timeout.
         DeviceKind::SupermicroIkvm => &state.bmc_http,
+        // Checked with the pinned certificate.
+        DeviceKind::Proxmox => {
+            let server = pve_server(&d);
+            return Ok(tokio::time::timeout(Duration::from_secs(4), proxmox::reachable(&server)).await.unwrap_or(false));
+        }
     };
     let check = http.get(&d.url).send();
     Ok(matches!(tokio::time::timeout(Duration::from_secs(4), check).await, Ok(Ok(_))))
@@ -372,11 +499,10 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
         return Ok(OpenedIn::Window);
     }
     if app.get_webview(&tab_label(&id)).is_none() {
-        let d = device(&state, &id)?;
         let window = app.get_window(MAIN_WINDOW).ok_or("Main window is gone")?;
         let bounds = *state.bounds.lock().unwrap();
         let label = tab_label(&id);
-        let spec = console_spec(&state, &d, &label).await?;
+        let spec = console_spec(&app, &state, &id, &label).await?;
         let mut builder = WebviewBuilder::new(&label, spec.url);
         if let Some(dir) = &state.webview_data {
             builder = builder.data_directory(dir.clone());
@@ -427,14 +553,9 @@ async fn open_window(app: AppHandle, state: State<'_, AppState>, id: String) -> 
     if focus_window(&app, &label) {
         return Ok(());
     }
-    let d = device(&state, &id)?;
-    let spec = console_spec(&state, &d, &label).await?;
-    let suffix = match d.kind {
-        DeviceKind::Nanokvm => "NanoKVM",
-        DeviceKind::SupermicroIkvm => "iKVM",
-    };
+    let spec = console_spec(&app, &state, &id, &label).await?;
     let mut builder = WebviewWindowBuilder::new(&app, &label, spec.url)
-        .title(format!("{} — {suffix}", d.name))
+        .title(&spec.title)
         .inner_size(1280.0, 800.0)
         .min_inner_size(640.0, 400.0);
     if let Some(dir) = &state.webview_data {
@@ -494,6 +615,8 @@ fn main() {
                 http,
                 bmc_http: ikvm::http_client()?,
                 relays: Mutex::new(HashMap::new()),
+                pve_sessions: Arc::new(proxmox::Sessions::default()),
+                guest_names: Mutex::new(HashMap::new()),
                 bounds: Mutex::new(ConsoleBounds { x: 0.0, y: 44.0, width: 1280.0, height: 776.0 }),
                 webview_data: location.webview_data.clone(),
             });
@@ -530,6 +653,7 @@ fn main() {
             save_device,
             delete_device,
             check_device,
+            list_guests,
             open_tab,
             show_tab,
             close_tab,

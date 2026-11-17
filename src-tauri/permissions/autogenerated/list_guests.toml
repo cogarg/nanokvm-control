@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-guests"
+description = "Enables the list_guests command without any pre-configured scope."
+commands.allow = ["list_guests"]
+
+[[permission]]
+identifier = "deny-list-guests"
+description = "Denies the list_guests command without any pre-configured scope."
+commands.deny = ["list_guests"]

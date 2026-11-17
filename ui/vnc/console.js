@@ -1,11 +1,13 @@
 'use strict';
-// Console page for Supermicro (ATEN) legacy iKVM, built on the vendored noVNC-iKVM core
-// (../vendor/novnc-ikvm, see its NOTICE.md). The app injects window.__NKC_IKVM = {port, token, name}
-// and runs a local WebSocket relay on that port; the relay logs in to the BMC and fills in the real
-// iKVM credentials, so this page only sends placeholders and never sees a password.
+// Console page for Supermicro (ATEN) legacy iKVM and Proxmox VE guests, built on the vendored
+// noVNC-iKVM core (../vendor/novnc-ikvm, see its NOTICE.md). The app injects
+// window.__NKC_VNC = {port, token, name} and runs a local WebSocket relay on that port. The relay
+// does all logins: for Supermicro it fills in the real iKVM credentials (this page only sends
+// placeholders), for Proxmox it completes the VNC password step and offers this page a connection
+// without a password. Either way the page never sees a password or ticket.
 (function () {
   const $ = (id) => document.getElementById(id);
-  const cfg = window.__NKC_IKVM;
+  const cfg = window.__NKC_VNC;
   const canvas = $('canvas');
   const screenEl = $('screen');
   const messageEl = $('message');
@@ -107,7 +109,8 @@
         if (name) document.title = `${cfg.name} — ${name}`;
       },
     });
-    // ATEN login fields; the relay replaces them with the real one-time credentials.
+    // ATEN login fields (Supermicro); the relay replaces them with the real one-time credentials.
+    // Proxmox consoles never ask for them.
     rfb.connect('127.0.0.1', cfg.port, 'nanokvm-control:placeholder', cfg.token);
   }
 
@@ -158,11 +161,11 @@
 
   if (!cfg) {
     setStatus('disconnected', 'Not started from NanoKVM Control');
-    showMessage('This page is opened by NanoKVM Control for Supermicro iKVM devices.');
+    showMessage('This page is opened by NanoKVM Control for Supermicro and Proxmox consoles.');
     updateControls();
     return;
   }
-  document.title = `${cfg.name} — iKVM`;
+  document.title = cfg.name;
   Util.init_logging('warn');
   connect();
 })();

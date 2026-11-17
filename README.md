@@ -1,17 +1,22 @@
 # nanokvm-control
 
-Control center for [Sipeed NanoKVM](https://github.com/sipeed/NanoKVM) devices and older
-**Supermicro BMCs** (the ones whose remote console is the Java iKVM viewer): a small Tauri v2 desktop
-app that keeps a list of your devices, shows whether each is reachable, and opens their consoles in
-tabs or separate windows, logging you in automatically.
+Control center for [Sipeed NanoKVM](https://github.com/sipeed/NanoKVM) devices, older
+**Supermicro BMCs** (the ones whose remote console is the Java iKVM viewer) and **Proxmox VE**
+virtual machines: a small Tauri v2 desktop app that keeps a list of your devices, shows whether each
+is reachable, and opens their consoles in tabs or separate windows, logging you in automatically.
 
 ## Features
 
-- Add / edit / delete devices (type, name, address, credentials)
-- Two device types:
+- Add / edit / delete devices (type, name, optional group, address, credentials). The add form
+  starts empty: no preselected type and no default usernames or passwords
+- **Groups:** give devices a group (e.g. "Rack A"), then use **Show** above the list to see all
+  devices, one group, or one Proxmox server. The list always opens on *All devices*
+- Three device types:
   - **NanoKVM**: its own web UI is the console
   - **Supermicro BMC (legacy Java iKVM)**: a built-in browser console replaces the Java viewer, no
     Java needed (see [Supermicro BMCs](#supermicro-bmcs-legacy-java-ikvm))
+  - **Proxmox VE server**: shown as a group of its VMs and containers, each with its console (see
+    [Proxmox VE](#proxmox-ve))
 - Online/offline status, polled every 15 s
 - **Connect** opens the device's console in a **tab** of the main window; switch with the tab bar,
   close with × or middle-click
@@ -83,12 +88,13 @@ Older Supermicro boards (and other boards with an ATEN-made BMC) only offer thei
 through a Java Web Start viewer. NanoKVM Control shows that console in a tab instead, using
 [noVNC-iKVM](ui/vendor/novnc-ikvm/NOTICE.md): noVNC with ATEN iKVM support by Kevin Kelley.
 
-Add the BMC with type **Supermicro BMC (legacy Java iKVM)**, its address and a BMC account (default
-`ADMIN`). An address without `http(s)://` is treated as HTTPS.
+Add the BMC with type **Supermicro BMC (legacy Java iKVM)**, its address and a BMC account
+(Supermicro's factory account is `ADMIN`; the form doesn't fill it in). An address without
+`http(s)://` is treated as HTTPS.
 
 How a connection works (`src-tauri/src/ikvm.rs`):
 
-1. The console tab loads the bundled page `ui/ikvm/` and connects to a WebSocket relay that the app
+1. The console tab loads the bundled page `ui/vnc/` and connects to a WebSocket relay that the app
    runs on `127.0.0.1` for that tab (random port and path), because pages can't open raw TCP
    connections.
 2. For each connection the relay logs in to the BMC's web interface, fetches the Java viewer's
@@ -115,6 +121,31 @@ Notes:
   as sharp as Java's at low quality settings (a known limitation of the decoder).
 - If the account is wrong, the tab says so and nothing is retried: BMCs lock accounts after
   repeated failed logins.
+
+## Proxmox VE
+
+Add a server with type **Proxmox VE server**, its address (port 8006 is used unless you give one)
+and a Proxmox account as `user@realm`, e.g. `root@pam` (`root` alone means `root@pam`). The list
+then shows a section for the server with its VMs and containers (templates are left out), refreshed
+every 15 s, and the **Show** menu can narrow the list to that server. **Connect** on a running guest
+opens its console in a tab; ↗ opens it in a window.
+
+How it works (`src-tauri/src/proxmox.rs`):
+
+- **Certificate pinning.** Proxmox normally uses a self-signed certificate, so the app trusts the
+  certificate it sees on first contact and saves its SHA-256 fingerprint (shown under the server's
+  name; compare it with *Node > System > Certificates* in Proxmox). Later connections with a
+  different certificate are refused before the password is sent. After a legitimate certificate
+  change, use *Edit > Forget certificate*.
+- **Login:** username + password for a Proxmox ticket, kept in memory and renewed before it expires.
+  Accounts with two-factor authentication aren't supported.
+- **Consoles:** the console page (the same noVNC page as for Supermicro) connects to a local relay.
+  For each connection the relay requests a console ticket (`vncproxy`), opens Proxmox's
+  `vncwebsocket`, answers the VNC password challenge with that ticket, and gives the page a
+  connection that needs no password. The page never sees the password or any ticket.
+- **Read-only:** the app only lists guests and opens consoles. It never starts, stops or changes
+  anything; start a stopped guest in Proxmox to use its console. An account (or custom role) with
+  just the `VM.Audit` and `VM.Console` privileges is enough.
 
 ## Where data lives
 
@@ -149,7 +180,9 @@ src-tauri/src/stream_watchdog.js  injected into consoles: restarts the MJPEG str
 src-tauri/src/store.rs device model + JSON persistence + address normalization
 src-tauri/src/ikvm.rs  Supermicro iKVM: BMC web login, launch-file credentials, WebSocket relay
 src-tauri/build.rs     declares the app's commands, so capabilities can limit them to the UI
-ui/ikvm/               console page for Supermicro iKVM (uses ui/vendor/novnc-ikvm)
+src-tauri/src/proxmox.rs  Proxmox VE: certificate pinning, login, guest list, console relay
+src-tauri/src/relay.rs    local WebSocket relay shared by the Supermicro and Proxmox consoles
+ui/vnc/                console page for Supermicro iKVM and Proxmox guests (uses ui/vendor/novnc-ikvm)
 ui/vendor/novnc-ikvm/  third-party noVNC-iKVM client (MPL-2.0), see its NOTICE.md
 src-tauri/src/crypto.rs NanoKVM password encoding (CryptoJS-compatible AES, as the web UI does)
 src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network prompt text
@@ -200,12 +233,12 @@ line of their own and are used under the repository's default MPL-2.0).
 | [Tauri](https://github.com/tauri-apps/tauri), wry, tao | Apache-2.0 / MIT |
 | [webkit2gtk-rs](https://github.com/tauri-apps/webkit2gtk-rs), [gtk-rs](https://github.com/gtk-rs/gtk3-rs) (Linux) | MIT |
 | [reqwest](https://github.com/seanmonstar/reqwest), [hyper](https://github.com/hyperium/hyper) | MIT / Apache-2.0, MIT |
-| [rustls](https://github.com/rustls/rustls) | Apache-2.0 / ISC / MIT |
+| [rustls](https://github.com/rustls/rustls), [ring](https://github.com/briansmith/ring), [rustls-native-certs](https://github.com/rustls/rustls-native-certs) | Apache-2.0 / ISC / MIT; ring: Apache-2.0 AND ISC |
 | [rust-native-tls](https://github.com/sfackler/rust-native-tls), [rust-openssl](https://github.com/sfackler/rust-openssl) (with the system's [OpenSSL](https://www.openssl.org/) on Linux) | MIT / Apache-2.0, Apache-2.0 |
 | [tokio](https://github.com/tokio-rs/tokio), [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) | MIT |
 | [futures-rs](https://github.com/rust-lang/futures-rs) | MIT / Apache-2.0 |
 | [serde](https://github.com/serde-rs/serde), [serde_json](https://github.com/serde-rs/json) | MIT / Apache-2.0 |
-| [RustCrypto](https://github.com/RustCrypto) `aes`, `cbc`, `md-5` | MIT / Apache-2.0 |
+| [RustCrypto](https://github.com/RustCrypto) `aes`, `cbc`, `md-5`, `des`, `sha2` | MIT / Apache-2.0 |
 | [rand](https://github.com/rust-random/rand), [uuid](https://github.com/uuid-rs/uuid), [base64](https://github.com/marshallpierce/rust-base64) | MIT / Apache-2.0 |
 | [urlencoding](https://github.com/kornelski/rust_urlencoding) | MIT |
 
@@ -218,3 +251,6 @@ The full dependency tree and each crate's license can be listed with
   CryptoJS-style password encryption) follows the NanoKVM web UI's own code.
 - Supermicro/ATEN iKVM: reverse-engineered by the projects above; Supermicro and ATEN aren't
   affiliated with this app.
+- [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment): uses its documented
+  [HTTP API](https://pve.proxmox.com/wiki/Proxmox_VE_API). Proxmox Server Solutions GmbH isn't
+  affiliated with this app; Proxmox is their trademark.

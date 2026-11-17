@@ -14,24 +14,19 @@
 //! 4. logs the web session out again once the iKVM login is done. The iKVM session keeps running;
 //!    the one-time credentials stop working, which is fine because every reconnect fetches new ones.
 
+use crate::relay::{self, PageSocket};
 use futures_util::{SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::watch,
+    net::TcpStream,
 };
-use tokio_tungstenite::tungstenite::{
-    handshake::server::{ErrorResponse, Request, Response},
-    http::{HeaderValue, StatusCode},
-    protocol::{frame::coding::CloseCode, CloseFrame},
-    Message,
-};
+use tokio_tungstenite::tungstenite::Message;
 
 /// BMC address and web login.
 #[derive(Clone)]
 pub struct Bmc {
-    /// Origin of the web UI, e.g. `https://192.168.2.240`.
+    /// Origin of the web UI, e.g. `https://192.0.2.240`.
     pub base: String,
     pub username: String,
     pub password: String,
@@ -175,86 +170,18 @@ fn substitute_credentials(chunk: &mut [u8], offset: usize, block: &[u8; 48], ate
     offset + chunk.len() >= CRED_END
 }
 
-/// A running relay for one console tab or window. Dropping it stops the relay and closes its
-/// connections.
-pub struct Relay {
-    pub port: u16,
-    /// Random path the page must connect to, so other local programs can't use the relay.
-    pub token: String,
-    shutdown: watch::Sender<bool>,
+/// Starts the relay for one Supermicro console (see the module docs).
+pub async fn start_relay(http: reqwest::Client, bmc: Bmc, kvm_host: String) -> Result<relay::Relay, String> {
+    relay::start(bmc.base.clone(), move |page| {
+        let (http, bmc, host) = (http.clone(), bmc.clone(), kvm_host.clone());
+        async move { serve(page, &http, &bmc, &host).await }
+    })
+    .await
 }
 
-impl Drop for Relay {
-    fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
-    }
-}
-
-pub async fn start_relay(http: reqwest::Client, bmc: Bmc, kvm_host: String) -> Result<Relay, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|e| format!("Could not start the console relay: {e}"))?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let token = uuid::Uuid::new_v4().simple().to_string();
-    let (shutdown, mut stop) = watch::channel(false);
-    let path = format!("/{token}");
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = stop.changed() => break,
-                accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { continue };
-                    let (http, bmc, host, path, stop) =
-                        (http.clone(), bmc.clone(), kvm_host.clone(), path.clone(), stop.clone());
-                    tauri::async_runtime::spawn(async move {
-                        serve(stream, &path, &http, &bmc, &host, stop).await;
-                    });
-                }
-            }
-        }
-    });
-    Ok(Relay { port, token, shutdown })
-}
-
-async fn serve(
-    stream: TcpStream,
-    path: &str,
-    http: &reqwest::Client,
-    bmc: &Bmc,
-    kvm_host: &str,
-    mut stop: watch::Receiver<bool>,
-) {
-    let check = |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
-        if req.uri().path() != path {
-            let mut err = ErrorResponse::new(None);
-            *err.status_mut() = StatusCode::FORBIDDEN;
-            return Err(err);
-        }
-        // noVNC asks for the "binary" subprotocol and treats the connection as base64 otherwise.
-        let wants_binary = req
-            .headers()
-            .get_all("sec-websocket-protocol")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .any(|v| v.split(',').any(|p| p.trim() == "binary"));
-        if wants_binary {
-            resp.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static("binary"));
-        }
-        Ok(resp)
-    };
-    let ws = match tokio_tungstenite::accept_hdr_async(stream, check).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!("[ikvm {}] rejected a relay connection: {e}", bmc.base);
-            return;
-        }
-    };
-    let (mut ws_tx, mut ws_rx) = ws.split();
-
-    let fail = |reason: String| {
-        eprintln!("[ikvm {}] {reason}", bmc.base);
-        CloseFrame { code: CloseCode::Error, reason: reason.chars().take(120).collect::<String>().into() }
-    };
+async fn serve(page: PageSocket, http: &reqwest::Client, bmc: &Bmc, kvm_host: &str) {
+    let (mut ws_tx, mut ws_rx) = page.split();
+    let fail = |reason: String| relay::fail(&bmc.base, reason);
     let ticket = match fetch_ticket(http, bmc).await {
         Ok(t) => t,
         Err(e) => {
@@ -331,7 +258,6 @@ async fn serve(
     tokio::select! {
         _ = down => {}
         _ = up => {}
-        _ = stop.changed() => {}
     }
 }
 
@@ -341,10 +267,10 @@ mod tests {
 
     #[test]
     fn parses_jnlp_arguments() {
-        let jnlp = "<application-desc main-class=\"x\">\n<argument>192.168.2.240</argument>\n\
+        let jnlp = "<application-desc main-class=\"x\">\n<argument>192.0.2.240</argument>\n\
                     <argument>AbC</argument>\n<argument>dEf</argument>\n<argument>null</argument>\n\
                     <argument>5900</argument>\n<argument>623</argument>\n</application-desc>";
-        assert_eq!(jnlp_arguments(jnlp), ["192.168.2.240", "AbC", "dEf", "null", "5900", "623"]);
+        assert_eq!(jnlp_arguments(jnlp), ["192.0.2.240", "AbC", "dEf", "null", "5900", "623"]);
     }
 
     #[test]

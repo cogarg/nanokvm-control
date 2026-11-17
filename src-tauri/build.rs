@@ -8,6 +8,7 @@ const COMMANDS: &[&str] = &[
     "save_device",
     "delete_device",
     "check_device",
+    "list_guests",
     "open_tab",
     "show_tab",
     "close_tab",

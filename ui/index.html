@@ -17,6 +17,11 @@
     <section id="home" class="home">
       <div class="home-head">
         <h1>Devices</h1>
+        <label id="filter" class="filter" hidden>Show
+          <select id="group-filter" aria-label="Show devices from">
+            <option value="">All devices</option>
+          </select>
+        </label>
         <div class="actions">
           <button id="refresh" class="ghost" title="Check all devices">Refresh</button>
           <button id="add" class="primary">Add device</button>
@@ -29,6 +34,7 @@
         <button class="primary" data-action="add">Add your first device</button>
       </section>
       <ul id="devices" class="grid"></ul>
+      <div id="pve"></div>
     </section>
     <!-- Shown under a console tab's webview until it paints. -->
     <div id="placeholder" class="placeholder" hidden>Connecting…</div>
@@ -38,16 +44,22 @@
     <form id="form" method="dialog">
       <h2 id="dialog-title">Add device</h2>
       <label>Type
-        <select name="kind">
+        <select name="kind" required>
+          <option value="" disabled>Choose a type…</option>
           <option value="nanokvm">NanoKVM</option>
           <option value="supermicro-ikvm">Supermicro BMC (legacy Java iKVM)</option>
+          <option value="proxmox">Proxmox VE server (lists its VMs as a group)</option>
         </select>
       </label>
       <label>Name
-        <input name="name" required placeholder="Rack server" autocomplete="off">
+        <input name="name" required placeholder="e.g. Rack server" autocomplete="off">
       </label>
+      <label id="group-row">Group <small>(optional)</small>
+        <input name="group" list="group-list" placeholder="e.g. Rack A" autocomplete="off">
+      </label>
+      <datalist id="group-list"></datalist>
       <label>Address
-        <input name="url" required placeholder="192.168.1.50 or https://kvm.lan" autocomplete="off" spellcheck="false">
+        <input name="url" required placeholder="e.g. 192.168.1.50 or https://kvm.lan" autocomplete="off" spellcheck="false">
       </label>
       <fieldset>
         <legend id="login-legend">Login (optional)</legend>
@@ -63,8 +75,9 @@
           <input name="autoLogin" type="checkbox">
           Log in automatically when connecting
         </label>
-        <p id="ikvm-hint" class="hint" hidden>The app logs in to the BMC's web interface with this
-          account each time you connect, to start the iKVM console.</p>
+        <p id="login-hint" class="hint" hidden></p>
+        <p id="cert-row" class="hint" hidden>Pinned certificate (SHA-256): <code id="cert-fp"></code>
+          <button type="button" id="forget-cert" class="link">Forget certificate</button></p>
       </fieldset>
       <p id="form-error" class="error" hidden></p>
       <div class="dialog-actions">
@@ -90,6 +103,7 @@
       <div class="card-head">
         <span class="dot" data-status="unknown" title="Checking…"></span>
         <h3 class="name"></h3>
+        <span class="group-tag" hidden></span>
       </div>
       <p class="url"></p>
       <p class="meta"></p>
@@ -101,6 +115,41 @@
         <span class="spacer"></span>
         <button class="ghost" data-action="edit">Edit</button>
         <button class="ghost danger" data-action="delete">Delete</button>
+      </div>
+    </li>
+  </template>
+
+  <template id="pve-section">
+    <section class="pve">
+      <div class="pve-head">
+        <span class="dot" data-status="unknown"></span>
+        <h2 class="name"></h2>
+        <span class="pve-sub"></span>
+        <span class="spacer"></span>
+        <button class="ghost" data-action="refresh" title="Reload the list of VMs and containers">Refresh</button>
+        <button class="ghost" data-action="edit">Edit</button>
+        <button class="ghost danger" data-action="delete">Delete</button>
+      </div>
+      <p class="pve-cert"></p>
+      <p class="error pve-error" hidden></p>
+      <ul class="grid guests"></ul>
+    </section>
+  </template>
+
+  <template id="guest-card">
+    <li class="card guest">
+      <div class="card-head">
+        <span class="dot" data-status="unknown"></span>
+        <h3 class="name"></h3>
+        <span class="group-tag kind-tag"></span>
+      </div>
+      <p class="url"></p>
+      <p class="meta"></p>
+      <div class="card-actions">
+        <button class="primary" data-action="connect" title="Open in a tab">Connect</button>
+        <button class="ghost icon" data-action="window" title="Open in new window" aria-label="Open in new window">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/></svg>
+        </button>
       </div>
     </li>
   </template>

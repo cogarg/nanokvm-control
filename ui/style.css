@@ -76,7 +76,10 @@ svg { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round
 .stage { flex: 1; min-height: 0; position: relative; overflow: auto; }
 .placeholder { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
 .home { padding: 22px 24px; max-width: 1200px; margin: 0 auto; }
-.home-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+.home-head { display: flex; align-items: center; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
+.home-head .actions { margin-left: auto; }
+.filter { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; color: var(--muted); }
+.filter select { padding: 5px 8px; max-width: 240px; }
 h1 { font-size: 18px; margin: 0; font-weight: 600; }
 .actions { display: flex; gap: 8px; }
 
@@ -105,6 +108,10 @@ button:focus-visible, input:focus-visible, .tab:focus-visible { outline: 2px sol
 }
 .card-head { display: flex; align-items: center; gap: 8px; }
 .card h3 { margin: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.group-tag {
+  margin-left: auto; flex: none; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+}
 .url { margin: 0; color: var(--muted); font-family: ui-monospace, monospace; font-size: 12.5px; word-break: break-all; }
 .meta { margin: 0 0 8px; color: var(--muted); font-size: 12.5px; min-height: 1.45em; }
 .meta.warn { color: var(--warn); }
@@ -145,3 +152,18 @@ fieldset { border: 1px solid var(--border); border-radius: var(--radius); paddin
 legend { color: var(--muted); padding: 0 4px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 form .error { margin: 0; }
+
+/* Proxmox servers: one section per server, its VMs/containers below. */
+#pve { display: flex; flex-direction: column; gap: 24px; margin-top: 24px; }
+#pve:empty { display: none; }
+.pve { border-top: 1px solid var(--border); padding-top: 16px; }
+.pve-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pve-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.pve-head .spacer { flex: 1; }
+.pve-sub { color: var(--muted); font-size: 12.5px; }
+.pve-cert { margin: 4px 0 12px; color: var(--muted); font-size: 11.5px; font-family: ui-monospace, monospace; word-break: break-all; }
+.pve-error { margin: 0 0 12px; }
+.guest .url { font-family: inherit; }
+.kind-tag { text-transform: uppercase; letter-spacing: .03em; }
+.dot[data-status="stopped"] { background: var(--unknown); box-shadow: none; }
+#cert-row code { font-size: 11px; word-break: break-all; }
