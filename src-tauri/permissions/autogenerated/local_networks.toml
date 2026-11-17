@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-networks"
+description = "Enables the local_networks command without any pre-configured scope."
+commands.allow = ["local_networks"]
+
+[[permission]]
+identifier = "deny-local-networks"
+description = "Denies the local_networks command without any pre-configured scope."
+commands.deny = ["local_networks"]

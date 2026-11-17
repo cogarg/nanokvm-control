@@ -7,16 +7,33 @@ is reachable, and opens their consoles in tabs or separate windows, logging you 
 
 ## Features
 
-- Add / edit / delete devices (type, name, optional group, address, credentials). The add form
-  starts empty: no preselected type and no default usernames or passwords
-- **Groups:** give devices a group (e.g. "Rack A"), then use **Show** above the list to see all
-  devices, one group, or one Proxmox server. The list always opens on *All devices*
-- Three device types:
-  - **NanoKVM**: its own web UI is the console
+- Add / edit / delete devices (type, name, group, address, credentials). Forms start empty: no
+  preselected type and no default usernames or passwords
+- **Groups** (**Add group**), of two kinds:
+  - **Standard group:** a name. Put devices in it with the device's **Group** menu (*None* or one
+    of your standard groups). Rename or delete it from its section; deleting keeps its devices.
+  - **Proxmox VE server:** address and login; the group lists that server's VMs and containers
+    (see [Proxmox VE](#proxmox-ve)). Devices can't be added to it.
+- The list shows ungrouped devices first, then a section per group. **Show** narrows it to one
+  group; it always opens on *All devices*
+- Device types:
+  - **NanoKVM** and **PiKVM**: their own web UI is the console, with optional auto-login
   - **Supermicro BMC (legacy Java iKVM)**: a built-in browser console replaces the Java viewer, no
     Java needed (see [Supermicro BMCs](#supermicro-bmcs-legacy-java-ikvm))
-  - **Proxmox VE server**: shown as a group of its VMs and containers, each with its console (see
-    [Proxmox VE](#proxmox-ve))
+  - **Dell iDRAC 9**: opens its HTML5 virtual console directly (see [Dell iDRAC 9](#dell-idrac-9))
+  - **VNC server**: any VNC server, with or without a password (see [VNC servers](#vnc-servers))
+- **Self-signed HTTPS certificates** are accepted on first contact and then pinned (see
+  [Certificates](#certificates))
+- **Find devices:** scans an address range you enter and recognises the supported device types
+  (see [Finding devices](#finding-devices))
+- **Passwords in the system keychain** (Keychain, Credential Manager, Secret Service), with an
+  **encrypted export/import** of the whole list (see [Where data lives](#where-data-lives))
+- **Quick connect:** **Ctrl+K** (or the search button in the tab bar) finds a device or VM by name,
+  address or group; Enter opens it in a tab, Shift+Enter in a window. It works while the device
+  list or tab bar has focus; inside a console all keys go to the remote machine
+- **Tiled view:** the tile button in the tab bar shows up to 4 open consoles side by side; clicking
+  another tab adds it, each tile can be shown alone or removed
+- **Reopen tabs** from the last session at startup (off unless turned on in **Settings**)
 - Online/offline status, polled every 15 s
 - **Connect** opens the device's console in a **tab** of the main window; switch with the tab bar,
   close with × or middle-click
@@ -122,9 +139,62 @@ Notes:
 - If the account is wrong, the tab says so and nothing is retried: BMCs lock accounts after
   repeated failed logins.
 
+## Dell iDRAC 9
+
+Add the iDRAC with type **Dell iDRAC 9**, its address (HTTPS) and an iDRAC account with the virtual
+console privilege. On each **Connect** the app (`src-tauri/src/idrac.rs`) logs in to the iDRAC web
+interface, asks it for the HTML5 virtual console address (which carries one-time console keys),
+logs out again right away, and opens that address in the tab. The console is the iDRAC's own viewer,
+with its Power, Boot, Keyboard and Virtual Media menus. Failed logins are never retried, since
+iDRACs block an address after repeated failures. Tested with iDRAC 9 firmware 7.00; iDRAC 8 and
+older use a different interface and aren't supported.
+
+## PiKVM
+
+Type **PiKVM** works like NanoKVM: the console is PiKVM's own web page (`/kvm/`), and auto-login
+uses its API (`POST /api/auth/login`). Accounts with two-factor codes have to log in by hand.
+*Not yet tested against a real PiKVM.*
+
+## VNC servers
+
+Type **VNC server** takes `host` or `host:port` (port 5900 by default) and an optional password.
+The console uses the same noVNC page as the Supermicro and Proxmox consoles; the app's relay
+(`src-tauri/src/vnc.rs`) connects to the server, answers the VNC password challenge itself, and
+gives the page a connection without a password, so the page never sees it. Supported: no password
+and the classic VNC password (RFB 3.3, 3.7, 3.8). Not supported: RealVNC account logins, Apple
+Remote Desktop logins, VeNCrypt/TLS. VNC itself is **not encrypted**; use it on trusted networks or
+through a tunnel.
+
+## Finding devices
+
+**Find devices** scans only the addresses you enter: a network (`192.168.1.0/24`, at most a /20 =
+4096 addresses), a range (`192.168.1.10-192.168.1.60` or `192.168.1.10-60`) or single addresses,
+separated by commas. This computer's networks are offered as one-click suggestions; nothing is
+scanned until you press **Scan**.
+
+Each address gets a short TCP check on ports 80, 443, 8006, 5900 and 5901 (128 addresses at a
+time). Addresses that answer are identified without logging in: the Proxmox page on 8006, the
+Redfish service root (Dell iDRAC), the page title (NanoKVM), PiKVM's page, the ATEN login page
+(older Supermicro BMCs) and the VNC greeting. Each result has **Add…**, which opens the Add dialog
+filled in with what was found (credentials stay empty). Devices already in the list are marked.
+
+## Certificates
+
+Devices with HTTPS often use self-signed certificates (Proxmox, iDRAC, PiKVM, NanoKVM in HTTPS
+mode). The app trusts the certificate a device presents on first contact and saves its SHA-256
+fingerprint with the device ("trust on first use"). From then on a different certificate is
+refused, with a message showing the new fingerprint, both for the app's own requests (logins,
+Proxmox API) and inside console tabs. The pinned fingerprint is shown in the device's **Edit** dialog
+(and on Proxmox sections); compare it with the one the device shows. After a legitimate certificate
+change, use **Edit > Forget certificate**.
+
+In console tabs this uses each web engine's certificate-error hook: WebKitGTK on Linux, WebView2 on
+Windows. macOS's WKWebView offers no such hook through Tauri, so on macOS consoles with self-signed
+certificates still fail to load (the app's own requests are pinned there too).
+
 ## Proxmox VE
 
-Add a server with type **Proxmox VE server**, its address (port 8006 is used unless you give one)
+Use **Add group** with type **Proxmox VE server**, its address (port 8006 is used unless you give one)
 and a Proxmox account as `user@realm`, e.g. `root@pam` (`root` alone means `root@pam`). The list
 then shows a section for the server with its VMs and containers (templates are left out), refreshed
 every 15 s, and the **Show** menu can narrow the list to that server. **Connect** on a running guest
@@ -149,13 +219,23 @@ How it works (`src-tauri/src/proxmox.rs`):
 
 ## Where data lives
 
-`devices.json` in the app config directory:
+`devices.json` (devices and Proxmox servers), `groups.json` (standard groups) and `settings.json`
+in the app config directory:
 
 - Linux: `~/.config/io.github.cogarg.nanokvm-control/` (file mode `0600`)
 - macOS: `~/Library/Application Support/io.github.cogarg.nanokvm-control/` (file mode `0600`)
 - Windows: `%APPDATA%\io.github.cogarg.nanokvm-control\` (protected by your user profile's permissions)
 
-**Passwords are stored in plain text in that file**, so treat it like an SSH config.
+**Passwords** are kept in the operating system's keychain: Keychain on macOS, Credential Manager
+on Windows, the Secret Service (GNOME Keyring, KWallet, …) on Linux, one entry per device under
+`io.github.cogarg.nanokvm-control`. Passwords from older versions are moved there automatically on
+the first start. If no keychain is available (e.g. a Linux system without a Secret Service), they
+stay in `devices.json` as before, readable only by your user, and **Settings** says so. Separate data
+folders (below) use separate keychain entries.
+
+**Export / import** (in **Settings**): exports all devices, groups and passwords to a `.nkcbackup`
+file encrypted with a passphrase (Argon2id key derivation, AES-256-GCM); importing merges such a
+file into the list (devices with the same id are updated, others added).
 
 ### Separate data for development and testing
 
@@ -182,7 +262,14 @@ src-tauri/src/ikvm.rs  Supermicro iKVM: BMC web login, launch-file credentials, 
 src-tauri/build.rs     declares the app's commands, so capabilities can limit them to the UI
 src-tauri/src/proxmox.rs  Proxmox VE: certificate pinning, login, guest list, console relay
 src-tauri/src/relay.rs    local WebSocket relay shared by the Supermicro and Proxmox consoles
-ui/vnc/                console page for Supermicro iKVM and Proxmox guests (uses ui/vendor/novnc-ikvm)
+src-tauri/src/secrets.rs  passwords in the system keychain
+src-tauri/src/backup.rs   encrypted export/import file format
+src-tauri/src/discovery.rs  "Find devices": address range parsing, scanning, recognising devices
+src-tauri/src/vnc.rs      VNC login (RFB 3.3/3.7/3.8), page greeting, relay for generic VNC servers
+src-tauri/src/idrac.rs    Dell iDRAC 9: login, virtual console address, logout
+src-tauri/src/tls.rs      certificate pinning ("trust on first use") for the app's own HTTPS requests
+src-tauri/src/console_tls.rs  certificate pinning inside console webviews (WebKitGTK, WebView2)
+ui/vnc/                console page for Supermicro iKVM, Proxmox guests and VNC servers (uses ui/vendor/novnc-ikvm)
 ui/vendor/novnc-ikvm/  third-party noVNC-iKVM client (MPL-2.0), see its NOTICE.md
 src-tauri/src/crypto.rs NanoKVM password encoding (CryptoJS-compatible AES, as the web UI does)
 src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network prompt text
@@ -190,8 +277,9 @@ src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network pr
 
 ## Known limitations
 
-- **HTTPS with self-signed certs:** status checks accept them, but the console window refuses the
-  certificate on every OS. Use HTTP on a trusted LAN or give the device a trusted certificate.
+- **Self-signed HTTPS in console tabs on macOS** isn't supported (see [Certificates](#certificates)).
+  On Linux and Windows the certificate is pinned on first contact. Within one app session, a
+  certificate accepted for a host applies to every console of that host.
 - **Video (Linux):** the console uses the system WebKitGTK. If H.264/WebRTC mode doesn't play, switch the
   NanoKVM to MJPEG mode in its settings. On NVIDIA, a blank window may need
   `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
@@ -236,11 +324,17 @@ line of their own and are used under the repository's default MPL-2.0).
 | [rustls](https://github.com/rustls/rustls), [ring](https://github.com/briansmith/ring), [rustls-native-certs](https://github.com/rustls/rustls-native-certs) | Apache-2.0 / ISC / MIT; ring: Apache-2.0 AND ISC |
 | [rust-native-tls](https://github.com/sfackler/rust-native-tls), [rust-openssl](https://github.com/sfackler/rust-openssl) (with the system's [OpenSSL](https://www.openssl.org/) on Linux) | MIT / Apache-2.0, Apache-2.0 |
 | [tokio](https://github.com/tokio-rs/tokio), [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) | MIT |
+| [webview2-com](https://github.com/wravery/webview2-rs) (Windows) | MIT |
+| [windows-rs](https://github.com/microsoft/windows-rs) `windows-core` (Windows) | MIT / Apache-2.0 |
 | [futures-rs](https://github.com/rust-lang/futures-rs) | MIT / Apache-2.0 |
 | [serde](https://github.com/serde-rs/serde), [serde_json](https://github.com/serde-rs/json) | MIT / Apache-2.0 |
 | [RustCrypto](https://github.com/RustCrypto) `aes`, `cbc`, `md-5`, `des`, `sha2` | MIT / Apache-2.0 |
 | [rand](https://github.com/rust-random/rand), [uuid](https://github.com/uuid-rs/uuid), [base64](https://github.com/marshallpierce/rust-base64) | MIT / Apache-2.0 |
 | [urlencoding](https://github.com/kornelski/rust_urlencoding) | MIT |
+| [keyring](https://github.com/open-source-cooperative/keyring-rs) | MIT / Apache-2.0 |
+| [RustCrypto](https://github.com/RustCrypto) `argon2`, `aes-gcm` | MIT / Apache-2.0 |
+| [tauri-plugin-dialog](https://github.com/tauri-apps/plugins-workspace) | MIT / Apache-2.0 |
+| [if-addrs](https://github.com/messense/if-addrs) | MIT / BSD-3-Clause |
 
 The full dependency tree and each crate's license can be listed with
 `cargo metadata` or [`cargo-about`](https://github.com/EmbarkStudios/cargo-about).
@@ -251,6 +345,10 @@ The full dependency tree and each crate's license can be listed with
   CryptoJS-style password encryption) follows the NanoKVM web UI's own code.
 - Supermicro/ATEN iKVM: reverse-engineered by the projects above; Supermicro and ATEN aren't
   affiliated with this app.
+- [PiKVM](https://pikvm.org/): auto-login uses its documented
+  [API](https://docs.pikvm.org/api/).
+- Dell iDRAC: the virtual console is Dell's own HTML5 viewer, opened the way the iDRAC web interface
+  opens it. Dell isn't affiliated with this app; iDRAC is a Dell trademark.
 - [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment): uses its documented
   [HTTP API](https://pve.proxmox.com/wiki/Proxmox_VE_API). Proxmox Server Solutions GmbH isn't
   affiliated with this app; Proxmox is their trademark.

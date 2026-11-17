@@ -12,16 +12,9 @@
 //!   connection that needs no password. The page never sees a ticket or a password.
 
 use crate::relay::{self, PageSocket};
-use des::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use crate::vnc::{self, Reader, WsIo};
 use futures_util::{SinkExt, StreamExt};
-use rustls::{
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    crypto::CryptoProvider,
-    pki_types::{CertificateDer, ServerName, UnixTime},
-    ClientConfig, DigitallySignedStruct, SignatureScheme,
-};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -47,108 +40,7 @@ impl Server {
     }
 }
 
-// ---------------------------------------------------------------- TLS pinning
-
-/// `AB:CD:…` SHA-256 fingerprint, formatted like Proxmox shows it (node > System > Certificates).
-pub fn fingerprint(der: &[u8]) -> String {
-    Sha256::digest(der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
-}
-
-#[derive(Debug)]
-struct PinVerifier {
-    expected: Option<String>,
-    seen: Mutex<Option<String>>,
-    provider: Arc<CryptoProvider>,
-}
-
-impl ServerCertVerifier for PinVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let fp = fingerprint(end_entity.as_ref());
-        *self.seen.lock().unwrap() = Some(fp.clone());
-        match &self.expected {
-            Some(expected) if *expected != fp => Err(rustls::Error::General("certificate fingerprint changed".into())),
-            _ => Ok(ServerCertVerified::assertion()),
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// TLS setup for one server, remembering which certificate it presented.
-struct Tls {
-    config: Arc<ClientConfig>,
-    verifier: Arc<PinVerifier>,
-}
-
-impl Tls {
-    fn new(expected: Option<String>) -> Result<Self, String> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let verifier = Arc::new(PinVerifier { expected, seen: Mutex::new(None), provider: provider.clone() });
-        let config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| e.to_string())?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier.clone())
-            .with_no_client_auth();
-        Ok(Tls { config: Arc::new(config), verifier })
-    }
-
-    fn seen(&self) -> Option<String> {
-        self.verifier.seen.lock().unwrap().clone()
-    }
-
-    /// Turns a failed request into a clear message when the certificate is the reason.
-    fn explain(&self, err: String) -> String {
-        match (&self.verifier.expected, self.seen()) {
-            (Some(expected), Some(seen)) if *expected != seen => format!(
-                "The server's certificate has changed, so the app refused to connect. New fingerprint: {seen}. \
-                 If you expected this (e.g. a renewed certificate), use Edit > Forget certificate."
-            ),
-            _ => err,
-        }
-    }
-
-    fn http(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
-            .use_preconfigured_tls((*self.config).clone())
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// Result of talking to a server, plus the certificate fingerprint it presented (to pin it).
-pub struct Reply<T> {
-    pub result: Result<T, String>,
-    pub fingerprint: Option<String>,
-}
+use crate::tls::{Reply, Tls};
 
 // ---------------------------------------------------------------- API
 
@@ -399,15 +291,7 @@ async fn serve(
 
     // Present the page with a password-less VNC connection (security type 1, "None").
     let mut page_rx = Reader::new(page_rx);
-    let handshake = async {
-        page_tx.send(Message::Binary(b"RFB 003.008\n".to_vec().into())).await.map_err(|e| e.to_string())?;
-        page_rx.read_exact(12).await?; // the page's protocol version
-        page_tx.send(Message::Binary(vec![1u8, 1].into())).await.map_err(|e| e.to_string())?;
-        page_rx.read_exact(1).await?; // the page picks type 1
-        page_tx.send(Message::Binary(vec![0u8, 0, 0, 0].into())).await.map_err(|e| e.to_string())?;
-        Ok::<(), String>(())
-    };
-    if let Err(e) = handshake.await {
+    if let Err(e) = vnc::greet_page(&mut WsIo { tx: &mut page_tx, rx: &mut page_rx }).await {
         let _ = page_tx.send(Message::Close(Some(relay::fail(name, format!("Console handshake failed ({e})"))))).await;
         return;
     }
@@ -525,117 +409,17 @@ async fn connect(server: &Server, sessions: &Sessions, target: &Target, tls: &Tl
 
     let (mut tx, rx) = ws.split();
     let mut rx = Reader::new(rx);
-    let version = rx.read_exact(12).await?;
-    if !version.starts_with(b"RFB 003.") {
-        return Err("Proxmox didn't answer with a VNC console".into());
-    }
-    tx.send(Message::Binary(b"RFB 003.008\n".to_vec().into())).await.map_err(|e| e.to_string())?;
-    let count = rx.read_exact(1).await?[0] as usize;
-    if count == 0 {
-        let len = u32::from_be_bytes(rx.read_exact(4).await?.try_into().unwrap()) as usize;
-        let reason = String::from_utf8_lossy(&rx.read_exact(len).await?).to_string();
-        return Err(format!("Proxmox refused the console: {reason}"));
-    }
-    let types = rx.read_exact(count).await?;
-    if types.contains(&2) {
-        tx.send(Message::Binary(vec![2u8].into())).await.map_err(|e| e.to_string())?;
-        let challenge = rx.read_exact(16).await?;
-        let response = vnc_auth_response(&proxy.ticket, &challenge);
-        tx.send(Message::Binary(response.to_vec().into())).await.map_err(|e| e.to_string())?;
-    } else if types.contains(&1) {
-        tx.send(Message::Binary(vec![1u8].into())).await.map_err(|e| e.to_string())?;
-    } else {
-        return Err(format!("Unsupported console security types {types:?}"));
-    }
-    let result = u32::from_be_bytes(rx.read_exact(4).await?.try_into().unwrap());
-    if result != 0 {
-        let reason = match rx.read_exact(4).await {
-            Ok(len) => {
-                let len = u32::from_be_bytes(len.try_into().unwrap()) as usize;
-                rx.read_exact(len).await.map(|r| String::from_utf8_lossy(&r).to_string()).unwrap_or_default()
-            }
-            Err(_) => String::new(),
-        };
-        return Err(format!("Proxmox refused the console login {reason}").trim().to_string());
-    }
+    vnc::login(&mut WsIo { tx: &mut tx, rx: &mut rx }, Some(&proxy.ticket))
+        .await
+        .map_err(|e| format!("Proxmox console: {e}"))?;
     let leftover = std::mem::take(&mut rx.buf);
     let ws = tx.reunite(rx.inner).map_err(|_| "internal error".to_string())?;
     Ok((ws, leftover))
 }
 
-/// Classic VNC authentication: DES-encrypt the 16-byte challenge with the password's first 8
-/// bytes (zero-padded, each byte's bits mirrored) as the key.
-fn vnc_auth_response(password: &str, challenge: &[u8]) -> [u8; 16] {
-    let mut key = [0u8; 8];
-    for (k, b) in key.iter_mut().zip(password.bytes()) {
-        *k = b.reverse_bits();
-    }
-    let cipher = des::Des::new(GenericArray::from_slice(&key));
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&challenge[..16]);
-    for block in out.chunks_mut(8) {
-        cipher.encrypt_block(GenericArray::from_mut_slice(block));
-    }
-    out
-}
-
-/// Reads exact byte counts from a stream of WebSocket binary messages.
-struct Reader<S> {
-    inner: S,
-    buf: Vec<u8>,
-}
-
-impl<S, E> Reader<S>
-where
-    S: futures_util::Stream<Item = Result<Message, E>> + Unpin,
-    E: std::fmt::Display,
-{
-    fn new(inner: S) -> Self {
-        Reader { inner, buf: Vec::new() }
-    }
-
-    async fn read_exact(&mut self, n: usize) -> Result<Vec<u8>, String> {
-        while self.buf.len() < n {
-            match tokio::time::timeout(Duration::from_secs(15), self.inner.next()).await {
-                Err(_) => return Err("timed out".into()),
-                Ok(None) => return Err("connection closed".into()),
-                Ok(Some(Err(e))) => return Err(e.to_string()),
-                Ok(Some(Ok(Message::Binary(b)))) => self.buf.extend_from_slice(&b),
-                Ok(Some(Ok(Message::Close(frame)))) => {
-                    return Err(frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty()).unwrap_or("connection closed".into()))
-                }
-                Ok(Some(Ok(_))) => {}
-            }
-        }
-        Ok(self.buf.drain(..n).collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn vnc_auth_matches_reference() {
-        // Reference: OpenSSL DES-ECB of the challenge 0x00..0x0f with the key "password" with each
-        // byte's bits mirrored (0e86ceceeef64e26), which is what VNC authentication specifies.
-        let challenge: Vec<u8> = (0u8..16).collect();
-        let got = vnc_auth_response("password", &challenge);
-        assert_eq!(hex(&got), REFERENCE);
-    }
-
-    const REFERENCE: &str = "b866924125c8eebb9debc1db61c538e2"; // openssl enc -des-ecb, mirrored key
-
-    fn hex(b: &[u8]) -> String {
-        b.iter().map(|x| format!("{x:02x}")).collect()
-    }
-
-    #[test]
-    fn formats_fingerprints_like_proxmox() {
-        let fp = fingerprint(b"abc");
-        assert_eq!(fp.len(), 32 * 3 - 1);
-        assert!(fp.starts_with("BA:78:16:BF:"));
-    }
 
     #[test]
     fn realm_defaults_to_pam() {

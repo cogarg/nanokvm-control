@@ -5,6 +5,15 @@
 // third-party code fed by the BMC.
 const COMMANDS: &[&str] = &[
     "list_devices",
+    "get_settings",
+    "save_settings",
+    "export_devices",
+    "import_devices",
+    "local_networks",
+    "discover",
+    "list_groups",
+    "save_group",
+    "delete_group",
     "save_device",
     "delete_device",
     "check_device",
@@ -13,7 +22,7 @@ const COMMANDS: &[&str] = &[
     "show_tab",
     "close_tab",
     "open_window",
-    "set_console_bounds",
+    "set_layout",
 ];
 
 fn main() {

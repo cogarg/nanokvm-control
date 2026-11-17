@@ -1,10 +1,17 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backup;
+mod console_tls;
 mod crypto;
+mod discovery;
+mod idrac;
 mod ikvm;
 mod proxmox;
 mod relay;
+mod secrets;
 mod store;
+mod tls;
+mod vnc;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +20,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use store::{Device, DeviceInput, DeviceKind, DeviceView, Store};
+use store::{Device, DeviceInput, DeviceKind, DeviceView, Group, GroupInput, Store};
 use tauri::{
     webview::WebviewBuilder, window::WindowBuilder, AppHandle, LogicalPosition, LogicalSize, Manager, Rect,
     State, Url, WebviewUrl, WebviewWindowBuilder,
@@ -35,6 +42,11 @@ struct ConsoleBounds {
 }
 
 impl ConsoleBounds {
+    #[cfg(target_os = "linux")]
+    fn gtk_rect(self) -> (i32, i32, i32, i32) {
+        (self.x.round() as i32, self.y.round() as i32, self.width.round() as i32, self.height.round() as i32)
+    }
+
     fn rect(self) -> Rect {
         Rect {
             position: LogicalPosition::new(self.x, self.y).into(),
@@ -129,7 +141,7 @@ mod gtk_overlay {
         OVERLAY.with(|o| *o.borrow_mut() = Some(overlay));
     }
 
-    pub fn adopt_console(console: gtk::Widget, top: i32) {
+    pub fn adopt_console(console: gtk::Widget, rect: (i32, i32, i32, i32)) {
         OVERLAY.with(|o| {
             let Some(overlay) = &*o.borrow() else { return };
             if let Some(parent) = console.parent().and_then(|p| p.downcast::<gtk::Container>().ok()) {
@@ -137,20 +149,21 @@ mod gtk_overlay {
             }
             console.set_halign(gtk::Align::Fill);
             console.set_valign(gtk::Align::Fill);
-            console.set_margin_top(top);
             overlay.add_overlay(&console);
         });
+        place(console, rect);
     }
 
-    pub fn set_top(top: i32) {
+    /// Positions a console at (x, y, width, height) within the overlay, via margins (the overlay
+    /// stretches its children; margins are what positions them).
+    pub fn place(console: gtk::Widget, (x, y, w, h): (i32, i32, i32, i32)) {
         OVERLAY.with(|o| {
             let Some(overlay) = &*o.borrow() else { return };
-            let ui = overlay.child();
-            for child in overlay.children() {
-                if Some(&child) != ui.as_ref() {
-                    child.set_margin_top(top);
-                }
-            }
+            let (ow, oh) = (overlay.allocated_width(), overlay.allocated_height());
+            console.set_margin_start(x.max(0));
+            console.set_margin_top(y.max(0));
+            console.set_margin_end((ow - x - w).max(0));
+            console.set_margin_bottom((oh - y - h).max(0));
         });
     }
 }
@@ -167,28 +180,67 @@ fn device(state: &AppState, id: &str) -> Result<Device, String> {
     state.store.lock().unwrap().get(id).cloned().ok_or_else(|| "Unknown device".into())
 }
 
-/// Script injected into a console webview: logs in once per webview, from the NanoKVM origin
-/// itself, so the server's HttpOnly `nano-kvm-token` cookie lands in the webview's cookie jar.
+/// Decides from the login reply `res` = {ok, status, j (JSON or null)}: null on success, else
+/// the reason shown to the user.
+const NANOKVM_JUDGE: &str = r#"function (res) {
+      var code = res.j && typeof res.j.code === 'number' ? res.j.code : null;
+      if (res.ok && (code === null || code === 0)) return null;
+      var reasons = {
+        '-2': 'the saved username or password is wrong',
+        '-4': 'the NanoKVM has temporarily locked all logins after too many failed attempts',
+        '-5': 'this account is temporarily locked after too many failed attempts'
+      };
+      return reasons[String(code)] || ('the NanoKVM answered: ' + ((res.j && res.j.msg) || ('HTTP ' + res.status)));
+    }"#;
+
+const PIKVM_JUDGE: &str = r#"function (res) {
+      if (res.ok) return null;
+      if (res.status === 403) return 'the saved username or password is wrong (two-factor codes are not supported)';
+      return 'the PiKVM answered HTTP ' + res.status;
+    }"#;
+
+/// Script injected into a console webview: logs in once per webview, from the device's own origin,
+/// so the session cookie lands in the webview's cookie jar exactly as with a manual login.
 fn autologin_script(d: &Device) -> Option<String> {
     if !d.auto_login || d.username.is_empty() || d.password.is_empty() {
         return None;
     }
     let origin = serde_json::to_string(&d.url).ok()?;
-    let body = serde_json::to_string(&serde_json::json!({
-        "username": d.username,
-        "password": crypto::encode_password(&d.password),
-    }))
-    .ok()?;
+    let (content_type, body, judge, after, product) = match d.kind {
+        // NanoKVM: JSON body, password encrypted the way its web UI does it.
+        DeviceKind::Nanokvm => (
+            "application/json",
+            serde_json::to_string(&serde_json::json!({
+                "username": d.username,
+                "password": crypto::encode_password(&d.password),
+            }))
+            .ok()?,
+            NANOKVM_JUDGE,
+            "/",
+            "NanoKVM",
+        ),
+        // PiKVM: form body (https://docs.pikvm.org/api/#authentication), then its KVM page.
+        DeviceKind::Pikvm => (
+            "application/x-www-form-urlencoded",
+            format!("user={}&passwd={}", urlencoding::encode(&d.username), urlencoding::encode(&d.password)),
+            PIKVM_JUDGE,
+            "/kvm/",
+            "PiKVM",
+        ),
+        _ => return None,
+    };
     let body = serde_json::to_string(&body).ok()?; // embed as a JS string literal
+    let after = serde_json::to_string(after).ok()?;
     Some(format!(
         r#"(function () {{
   if (window.top !== window || location.origin !== {origin}) return;
   var FLAG = '__nanokvm_control_autologin';
   try {{ if (sessionStorage.getItem(FLAG)) return; sessionStorage.setItem(FLAG, '1'); }} catch (e) {{ return; }}
+  var judge = {judge};
   fetch('/api/auth/login', {{
     method: 'POST',
     credentials: 'same-origin',
-    headers: {{ 'Content-Type': 'application/json' }},
+    headers: {{ 'Content-Type': '{content_type}' }},
     body: {body}
   }})
     .then(function (r) {{
@@ -196,18 +248,13 @@ fn autologin_script(d: &Device) -> Option<String> {
         .then(function (j) {{ return {{ ok: r.ok, status: r.status, j: j }}; }});
     }})
     .then(function (res) {{
-      var code = res.j && typeof res.j.code === 'number' ? res.j.code : null;
-      if (res.ok && (code === null || code === 0)) {{ location.replace(location.origin + '/'); return; }}
-      var reasons = {{
-        '-2': 'the saved username or password is wrong',
-        '-4': 'the NanoKVM has temporarily locked all logins after too many failed attempts',
-        '-5': 'this account is temporarily locked after too many failed attempts'
-      }};
-      fail(reasons[String(code)] || ('the NanoKVM answered: ' + ((res.j && res.j.msg) || ('HTTP ' + res.status))));
+      var reason = judge(res);
+      if (reason === null) {{ location.replace(location.origin + {after}); return; }}
+      fail(reason);
     }})
     .catch(function (e) {{ fail('the login request failed (' + e + ')'); }});
 
-  // Tell the user instead of failing silently; the banner sits above the NanoKVM page.
+  // Tell the user instead of failing silently; the banner sits above the {product} page.
   function fail(reason) {{
     console.warn('[NanoKVM Control] auto-login failed: ' + reason);
     function show() {{
@@ -258,7 +305,8 @@ fn disable_disk_cache(webview: &webkit2gtk::WebView) {
 }
 
 fn console_url(d: &Device) -> Result<WebviewUrl, String> {
-    Ok(WebviewUrl::External(Url::parse(&d.url).map_err(|e| e.to_string())?))
+    let path = if d.kind == DeviceKind::Pikvm { "/kvm/" } else { "/" };
+    Ok(WebviewUrl::External(Url::parse(&format!("{}{path}", d.url)).map_err(|e| e.to_string())?))
 }
 
 /// What a console webview loads and which scripts it gets.
@@ -267,6 +315,70 @@ struct ConsoleSpec {
     scripts: Vec<String>,
     /// Window title for pop-out windows.
     title: String,
+    /// HTTPS web console: the device whose pinned certificate the webview must accept (see
+    /// console_tls). The webview then starts on about:blank and is navigated once the check is in.
+    pin: Option<String>,
+}
+
+impl ConsoleSpec {
+    /// The URL to create the webview with.
+    fn initial_url(&self) -> WebviewUrl {
+        if self.pin.is_some() {
+            WebviewUrl::External(Url::parse("about:blank").unwrap())
+        } else {
+            self.url.clone()
+        }
+    }
+
+    /// The URL to navigate to after the certificate check is installed (when there is one).
+    fn deferred_url(&self) -> Option<Url> {
+        match (&self.pin, &self.url) {
+            (Some(_), WebviewUrl::External(u)) => Some(u.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Certificate check for a device's HTTPS console: pins the first certificate, then insists on it.
+fn pin_check(app: &AppHandle, id: &str) -> console_tls::Check {
+    let (app, id) = (app.clone(), id.to_string());
+    Arc::new(move |fp: &str| {
+        let state = app.state::<AppState>();
+        let mut store = state.store.lock().unwrap();
+        let Some(d) = store.get(&id).cloned() else {
+            return console_tls::Verdict::Refuse("This device no longer exists.".into());
+        };
+        if d.tls_fingerprint.is_empty() {
+            store.pin_fingerprint(&id, fp);
+            console_tls::Verdict::Allow
+        } else if d.tls_fingerprint == fp {
+            console_tls::Verdict::Allow
+        } else {
+            console_tls::Verdict::Refuse(format!(
+                "{} presented a different certificate than the one saved for it, so its console was not loaded \
+                 (it could be someone impersonating it). New SHA-256 fingerprint: {fp}. If you expected this, \
+                 for example after a certificate renewal, use Edit > Forget certificate on the device and connect again.",
+                d.name
+            ))
+        }
+    })
+}
+
+/// Installs the certificate check in a freshly created console webview (Linux and Windows).
+fn install_pin_check(p: &tauri::webview::PlatformWebview, check: console_tls::Check) {
+    #[cfg(target_os = "linux")]
+    console_tls::install(&p.inner(), check);
+    #[cfg(windows)]
+    if let Err(e) = console_tls::install(p, check) {
+        eprintln!("[console] could not install the certificate check: {e}");
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = (p, check);
+}
+
+/// HTTPS web consoles pin the device's certificate in the webview.
+fn web_console_pin(d: &Device) -> Option<String> {
+    (d.kind.web_console() && d.url.starts_with("https://")).then(|| d.id.clone())
 }
 
 /// Console ids are device ids, or `pve:<server id>:<node>:<qemu|lxc>:<vmid>` for Proxmox guests.
@@ -333,6 +445,7 @@ async fn console_spec(app: &AppHandle, state: &AppState, id: &str, label: &str) 
             url: WebviewUrl::App("vnc/index.html".into()),
             scripts: vec![script],
             title: format!("{name} — {}", server.name),
+            pin: None,
         });
     }
     let d = device(state, id)?;
@@ -341,7 +454,51 @@ async fn console_spec(app: &AppHandle, state: &AppState, id: &str, label: &str) 
             url: console_url(&d)?,
             scripts: [autologin_script(&d), stream_watchdog_script(&d)].into_iter().flatten().collect(),
             title: format!("{} — NanoKVM", d.name),
+            pin: web_console_pin(&d),
         }),
+        DeviceKind::Pikvm => Ok(ConsoleSpec {
+            url: console_url(&d)?,
+            scripts: autologin_script(&d).into_iter().collect(),
+            title: format!("{} — PiKVM", d.name),
+            pin: web_console_pin(&d),
+        }),
+        DeviceKind::Idrac => {
+            if d.username.is_empty() || d.password.is_empty() {
+                return Err("Save the iDRAC username and password first (Edit)".into());
+            }
+            let reply = idrac::console_url(&idrac::Idrac {
+                base: d.url.clone(),
+                username: d.username.clone(),
+                password: d.password.clone(),
+                fingerprint: Some(d.tls_fingerprint.clone()).filter(|f| !f.is_empty()),
+            })
+            .await;
+            if let Some(fp) = reply.fingerprint {
+                state.store.lock().unwrap().pin_fingerprint(&d.id, &fp);
+            }
+            let location = Url::parse(&reply.result?).map_err(|e| e.to_string())?;
+            Ok(ConsoleSpec {
+                url: WebviewUrl::External(location),
+                scripts: vec![],
+                title: format!("{} — iDRAC", d.name),
+                pin: Some(d.id.clone()),
+            })
+        }
+        DeviceKind::Vnc => {
+            let url = Url::parse(&d.url).map_err(|e| e.to_string())?;
+            let host = url.host_str().ok_or("The address has no host")?.trim_matches(['[', ']']).to_string();
+            let port = url.port().unwrap_or(5900);
+            let password = Some(d.password.clone()).filter(|p| !p.is_empty());
+            let relay = vnc::start_relay(host, port, password).await?;
+            let script = vnc_page(&relay, &d.name);
+            state.relays.lock().unwrap().insert(label.to_string(), relay);
+            Ok(ConsoleSpec {
+                url: WebviewUrl::App("vnc/index.html".into()),
+                scripts: vec![script],
+                title: format!("{} — VNC", d.name),
+                pin: None,
+            })
+        }
         DeviceKind::SupermicroIkvm => {
             if d.username.is_empty() || d.password.is_empty() {
                 return Err("Save the BMC username and password first (Edit)".into());
@@ -356,6 +513,7 @@ async fn console_spec(app: &AppHandle, state: &AppState, id: &str, label: &str) 
                 url: WebviewUrl::App("vnc/index.html".into()),
                 scripts: vec![script],
                 title: format!("{} — iKVM", d.name),
+                pin: None,
             })
         }
         DeviceKind::Proxmox => Err("A Proxmox server has no console of its own; connect to one of its VMs".into()),
@@ -412,6 +570,138 @@ fn close_tab_webview(app: &AppHandle, id: &str) {
 #[tauri::command]
 fn list_devices(state: State<AppState>) -> Vec<DeviceView> {
     state.store.lock().unwrap().views()
+}
+
+/// Settings plus where passwords are kept ("keychain" or "file").
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsView {
+    #[serde(flatten)]
+    settings: store::Settings,
+    password_storage: &'static str,
+}
+
+#[tauri::command]
+fn get_settings(state: State<AppState>) -> SettingsView {
+    let store = state.store.lock().unwrap();
+    SettingsView { settings: store::load_settings(store.path()), password_storage: store.password_storage() }
+}
+
+/// Saves the settings; open tabs are only remembered while "reopen tabs" is on.
+#[tauri::command]
+fn save_settings(state: State<AppState>, settings: store::Settings) -> Result<(), String> {
+    let store = state.store.lock().unwrap();
+    store::save_settings(store.path(), &settings)
+}
+
+/// Writes an encrypted export of all devices (with passwords) and groups to a file the user picks.
+/// Returns the file's path, or `None` if the user cancelled.
+#[tauri::command]
+async fn export_devices(app: AppHandle, state: State<'_, AppState>, passphrase: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    if passphrase.chars().count() < backup::MIN_PASSPHRASE {
+        return Err(format!("Use a passphrase of at least {} characters", backup::MIN_PASSPHRASE));
+    }
+    let contents = state.store.lock().unwrap().export_contents();
+    let picker = app
+        .dialog()
+        .file()
+        .set_title("Export devices")
+        .set_file_name(format!("nanokvm-control-devices.{}", backup::EXTENSION))
+        .add_filter("NanoKVM Control backup", &[backup::EXTENSION]);
+    let path = tauri::async_runtime::spawn_blocking(move || picker.blocking_save_file())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = path.and_then(|p| p.into_path().ok()) else { return Ok(None) };
+    // Argon2 with 64 MiB takes a moment; keep it off the async workers.
+    let text = tauri::async_runtime::spawn_blocking(move || backup::encrypt(&contents, &passphrase))
+        .await
+        .map_err(|e| e.to_string())??;
+    std::fs::write(&path, text).map_err(|e| format!("Could not write the file: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(Some(path.display().to_string()))
+}
+
+/// Reads an export the user picks and merges it into the device list. Returns a summary, or
+/// `None` if the user cancelled.
+#[tauri::command]
+async fn import_devices(app: AppHandle, state: State<'_, AppState>, passphrase: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picker = app
+        .dialog()
+        .file()
+        .set_title("Import devices")
+        .add_filter("NanoKVM Control backup", &[backup::EXTENSION]);
+    let path = tauri::async_runtime::spawn_blocking(move || picker.blocking_pick_file())
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(path) = path.and_then(|p| p.into_path().ok()) else { return Ok(None) };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("Could not read the file: {e}"))?;
+    let contents = tauri::async_runtime::spawn_blocking(move || backup::decrypt(&text, &passphrase))
+        .await
+        .map_err(|e| e.to_string())??;
+    let (added, updated, groups) = state.store.lock().unwrap().import(contents)?;
+    Ok(Some(format!(
+        "Imported: {added} new device{}, {updated} updated, {groups} new group{}.",
+        if added == 1 { "" } else { "s" },
+        if groups == 1 { "" } else { "s" }
+    )))
+}
+
+/// This computer's networks, offered as ranges for "Find devices".
+#[tauri::command]
+fn local_networks() -> Vec<String> {
+    discovery::local_networks()
+}
+
+/// A device found by a scan, plus the name it already has in the list (if any).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FoundView {
+    #[serde(flatten)]
+    found: discovery::Found,
+    existing: Option<String>,
+}
+
+/// Scans the address range the user entered for supported devices.
+#[tauri::command]
+async fn discover(state: State<'_, AppState>, range: String) -> Result<Vec<FoundView>, String> {
+    let addresses = discovery::parse_ranges(&range)?;
+    let found = discovery::scan(addresses).await;
+    let devices = state.store.lock().unwrap().views();
+    let host_of = |url: &str| {
+        let with_scheme = if url.contains("://") { url.to_string() } else { format!("x://{url}") };
+        Url::parse(&with_scheme).ok().and_then(|u| u.host_str().map(str::to_string))
+    };
+    Ok(found
+        .into_iter()
+        .map(|f| {
+            let existing = devices
+                .iter()
+                .find(|d| host_of(&d.url).as_deref() == Some(f.address.as_str()))
+                .map(|d| d.name.clone());
+            FoundView { found: f, existing }
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn list_groups(state: State<AppState>) -> Vec<Group> {
+    state.store.lock().unwrap().groups()
+}
+
+#[tauri::command]
+fn save_group(state: State<AppState>, input: GroupInput) -> Result<Group, String> {
+    state.store.lock().unwrap().upsert_group(input)
+}
+
+#[tauri::command]
+fn delete_group(state: State<AppState>, id: String) -> Result<(), String> {
+    state.store.lock().unwrap().delete_group(&id)
 }
 
 #[tauri::command]
@@ -484,6 +774,16 @@ async fn check_device(state: State<'_, AppState>, id: String) -> Result<bool, St
             let server = pve_server(&d);
             return Ok(tokio::time::timeout(Duration::from_secs(4), proxmox::reachable(&server)).await.unwrap_or(false));
         }
+        // Self-signed certificates are fine for a reachability check.
+        DeviceKind::Pikvm | DeviceKind::Idrac => &state.http,
+        // Reachable if its port accepts a connection.
+        DeviceKind::Vnc => {
+            let url = Url::parse(&d.url).map_err(|e| e.to_string())?;
+            let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']).to_string();
+            let port = url.port().unwrap_or(5900);
+            let connect = tokio::net::TcpStream::connect((host.as_str(), port));
+            return Ok(matches!(tokio::time::timeout(Duration::from_secs(4), connect).await, Ok(Ok(_))));
+        }
     };
     let check = http.get(&d.url).send();
     Ok(matches!(tokio::time::timeout(Duration::from_secs(4), check).await, Ok(Ok(_))))
@@ -503,11 +803,11 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
         let bounds = *state.bounds.lock().unwrap();
         let label = tab_label(&id);
         let spec = console_spec(&app, &state, &id, &label).await?;
-        let mut builder = WebviewBuilder::new(&label, spec.url);
+        let mut builder = WebviewBuilder::new(&label, spec.initial_url());
         if let Some(dir) = &state.webview_data {
             builder = builder.data_directory(dir.clone());
         }
-        for script in spec.scripts {
+        for script in spec.scripts.iter().cloned() {
             builder = builder.initialization_script(script);
         }
         let rect = bounds.rect();
@@ -518,17 +818,22 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
                 return Err(format!("Could not open console: {e}"));
             }
         };
-        #[cfg(target_os = "linux")]
-        {
-            let top = bounds.y.round() as i32;
-            let _ = webview.with_webview(move |p| {
+        let check = spec.pin.as_deref().map(|id| pin_check(&app, id));
+        let _ = webview.with_webview(move |p| {
+            if let Some(check) = check {
+                install_pin_check(&p, check);
+            }
+            #[cfg(target_os = "linux")]
+            {
                 use gtk::prelude::Cast;
                 disable_disk_cache(&p.inner());
-                gtk_overlay::adopt_console(p.inner().upcast(), top);
-            });
+                gtk_overlay::adopt_console(p.inner().upcast(), bounds.gtk_rect());
+            }
+        });
+        // Runs after the closure above (both go through the main thread's queue, in order).
+        if let Some(url) = spec.deferred_url() {
+            let _ = webview.navigate(url);
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = webview;
     }
     show_only(&app, Some(&id));
     Ok(OpenedIn::Tab)
@@ -554,14 +859,14 @@ async fn open_window(app: AppHandle, state: State<'_, AppState>, id: String) -> 
         return Ok(());
     }
     let spec = console_spec(&app, &state, &id, &label).await?;
-    let mut builder = WebviewWindowBuilder::new(&app, &label, spec.url)
+    let mut builder = WebviewWindowBuilder::new(&app, &label, spec.initial_url())
         .title(&spec.title)
         .inner_size(1280.0, 800.0)
         .min_inner_size(640.0, 400.0);
     if let Some(dir) = &state.webview_data {
         builder = builder.data_directory(dir.clone());
     }
-    for script in spec.scripts {
+    for script in spec.scripts.iter().cloned() {
         builder = builder.initialization_script(script);
     }
     let window = match builder.build() {
@@ -577,31 +882,71 @@ async fn open_window(app: AppHandle, state: State<'_, AppState>, id: String) -> 
             stop_relay(&handle, &closed_label);
         }
     });
-    #[cfg(target_os = "linux")]
-    let _ = window.with_webview(|p| disable_disk_cache(&p.inner()));
-    #[cfg(not(target_os = "linux"))]
-    let _ = window;
+    let check = spec.pin.as_deref().map(|id| pin_check(&app, id));
+    let _ = window.with_webview(move |p| {
+        if let Some(check) = check {
+            install_pin_check(&p, check);
+        }
+        #[cfg(target_os = "linux")]
+        disable_disk_cache(&p.inner());
+    });
+    if let Some(url) = spec.deferred_url() {
+        let _ = window.navigate(url);
+    }
     Ok(())
 }
 
-/// Called by the UI whenever the area below its tab bar moves or resizes.
+/// One console placed by the UI: its id and where it goes (logical px, window-relative).
+#[derive(Deserialize)]
+struct Tile {
+    id: String,
+    #[serde(flatten)]
+    bounds: ConsoleBounds,
+}
+
+/// Lays out the console tabs: the given ones are shown at their rectangles, all others hidden.
+/// One tile is the normal single-tab view, several are the tiled view, none is the device list.
+/// `area` (everything below the tab bar) is where new tabs start out.
 #[tauri::command]
-fn set_console_bounds(app: AppHandle, state: State<AppState>, bounds: ConsoleBounds) {
-    *state.bounds.lock().unwrap() = bounds;
+fn set_layout(app: AppHandle, state: State<AppState>, area: ConsoleBounds, tiles: Vec<Tile>, focus: Option<String>) {
+    *state.bounds.lock().unwrap() = area;
+    let placed: HashMap<String, ConsoleBounds> = tiles.into_iter().map(|t| (tab_label(&t.id), t.bounds)).collect();
     for (label, webview) in app.webviews() {
-        if label.starts_with("tab-") {
-            let _ = webview.set_bounds(bounds.rect());
+        if !label.starts_with("tab-") {
+            continue;
+        }
+        match placed.get(&label) {
+            Some(&bounds) => {
+                let _ = webview.set_bounds(bounds.rect());
+                #[cfg(target_os = "linux")]
+                let _ = webview.with_webview(move |p| {
+                    use gtk::prelude::Cast;
+                    gtk_overlay::place(p.inner().upcast(), bounds.gtk_rect());
+                });
+                let _ = webview.show();
+            }
+            None => {
+                let _ = webview.hide();
+            }
         }
     }
-    #[cfg(target_os = "linux")]
-    {
-        let top = bounds.y.round() as i32;
-        let _ = app.run_on_main_thread(move || gtk_overlay::set_top(top));
+    match focus.and_then(|id| app.get_webview(&tab_label(&id))) {
+        Some(w) => {
+            let _ = w.set_focus();
+        }
+        None if placed.is_empty() => {
+            if let Some(ui) = app.get_webview(UI_WEBVIEW) {
+                let _ = ui.set_focus();
+            }
+        }
+        None => {}
     }
 }
 
 fn main() {
     tauri::Builder::default()
+        // File pickers for export/import, used from Rust only (the UI gets no dialog permissions).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let location = data_location(app)?;
             let http = reqwest::Client::builder()
@@ -611,7 +956,11 @@ fn main() {
                 .danger_accept_invalid_certs(true)
                 .build()?;
             app.manage(AppState {
-                store: Mutex::new(Store::load(location.devices_file)),
+                store: Mutex::new(Store::load(location.devices_file, {
+                    // Separate data folders get separate keychain entries (see secrets.rs).
+                    let namespace = location.isolated_root.as_ref().map(|p| p.display().to_string());
+                    Arc::new(secrets::Keychain::new(namespace.as_deref()))
+                })),
                 http,
                 bmc_http: ikvm::http_client()?,
                 relays: Mutex::new(HashMap::new()),
@@ -650,6 +999,15 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             list_devices,
+            get_settings,
+            save_settings,
+            export_devices,
+            import_devices,
+            local_networks,
+            discover,
+            list_groups,
+            save_group,
+            delete_group,
             save_device,
             delete_device,
             check_device,
@@ -658,7 +1016,7 @@ fn main() {
             show_tab,
             close_tab,
             open_window,
-            set_console_bounds
+            set_layout
         ])
         .run(tauri::generate_context!())
         .expect("error while running NanoKVM Control");

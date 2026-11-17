@@ -11,6 +11,14 @@
     <svg class="logo" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M9 20h6M12 16v4M7 8l3 2-3 2M12 12h4"/></svg>
     <button id="home-tab" class="tab home" role="tab" aria-selected="true">Devices</button>
     <div id="tabs" class="tabs"></div>
+    <div class="tabbar-tools">
+      <button id="tile-btn" class="tool" aria-pressed="false" title="Tile up to 4 open consoles side by side" aria-label="Tile consoles" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="7.5" height="6.5" rx="1"/><rect x="13" y="4.5" width="7.5" height="6.5" rx="1"/><rect x="3.5" y="13" width="7.5" height="6.5" rx="1"/><rect x="13" y="13" width="7.5" height="6.5" rx="1"/></svg>
+      </button>
+      <button id="quick-btn" class="tool" title="Quick connect (Ctrl+K)" aria-label="Quick connect">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+      </button>
+    </div>
   </nav>
 
   <div id="stage" class="stage">
@@ -23,21 +31,31 @@
           </select>
         </label>
         <div class="actions">
+          <button id="settings-btn" class="ghost" title="Settings">Settings</button>
           <button id="refresh" class="ghost" title="Check all devices">Refresh</button>
+          <button id="find-btn" class="ghost" title="Scan an address range for devices">Find devices</button>
+          <button id="add-group" class="ghost">Add group</button>
           <button id="add" class="primary">Add device</button>
         </div>
       </div>
       <p id="error" class="error" hidden></p>
       <section id="empty" class="empty" hidden>
         <h2>No devices yet</h2>
-        <p>Add a NanoKVM by its IP address or hostname to open its console from here.</p>
-        <button class="primary" data-action="add">Add your first device</button>
+        <p>Add a NanoKVM, PiKVM, server BMC, VNC server or Proxmox server by its address, or let the app
+          look for them in an address range you choose.</p>
+        <div class="actions">
+          <button class="ghost" data-action="find">Find devices</button>
+          <button class="primary" data-action="add">Add your first device</button>
+        </div>
       </section>
       <ul id="devices" class="grid"></ul>
+      <div id="groups"></div>
       <div id="pve"></div>
     </section>
     <!-- Shown under a console tab's webview until it paints. -->
     <div id="placeholder" class="placeholder" hidden>Connecting…</div>
+    <!-- Tiled view: the console webviews are drawn natively over each tile's body. -->
+    <div id="tiles" class="tiles" hidden></div>
   </div>
 
   <dialog id="dialog">
@@ -47,23 +65,24 @@
         <select name="kind" required>
           <option value="" disabled>Choose a type…</option>
           <option value="nanokvm">NanoKVM</option>
+          <option value="pikvm">PiKVM</option>
           <option value="supermicro-ikvm">Supermicro BMC (legacy Java iKVM)</option>
-          <option value="proxmox">Proxmox VE server (lists its VMs as a group)</option>
+          <option value="idrac">Dell iDRAC 9</option>
+          <option value="vnc">VNC server</option>
         </select>
       </label>
       <label>Name
         <input name="name" required placeholder="e.g. Rack server" autocomplete="off">
       </label>
-      <label id="group-row">Group <small>(optional)</small>
-        <input name="group" list="group-list" placeholder="e.g. Rack A" autocomplete="off">
+      <label>Group
+        <select name="group"></select>
       </label>
-      <datalist id="group-list"></datalist>
       <label>Address
         <input name="url" required placeholder="e.g. 192.168.1.50 or https://kvm.lan" autocomplete="off" spellcheck="false">
       </label>
       <fieldset>
         <legend id="login-legend">Login (optional)</legend>
-        <label>Username
+        <label id="username-row">Username
           <input name="username" autocomplete="off" spellcheck="false">
         </label>
         <label>Password
@@ -76,15 +95,125 @@
           Log in automatically when connecting
         </label>
         <p id="login-hint" class="hint" hidden></p>
-        <p id="cert-row" class="hint" hidden>Pinned certificate (SHA-256): <code id="cert-fp"></code>
-          <button type="button" id="forget-cert" class="link">Forget certificate</button></p>
       </fieldset>
+      <p id="device-cert-row" class="hint" hidden>Pinned certificate (SHA-256): <code id="device-cert-fp"></code>
+        <button type="button" id="device-forget-cert" class="link">Forget certificate</button></p>
       <p id="form-error" class="error" hidden></p>
       <div class="dialog-actions">
         <button type="button" id="cancel" class="ghost">Cancel</button>
         <button type="submit" class="primary">Save</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="group-dialog">
+    <form id="group-form" method="dialog">
+      <h2 id="group-dialog-title">Add group</h2>
+      <label>Type
+        <select name="type" required>
+          <option value="standard">Standard group</option>
+          <option value="proxmox">Proxmox VE server (shows its VMs and containers)</option>
+        </select>
+      </label>
+      <label>Name
+        <input name="name" required placeholder="e.g. Rack A" autocomplete="off">
+      </label>
+      <div id="pve-fields" class="stack" hidden>
+        <label>Address
+          <input name="url" placeholder="e.g. 192.168.1.10 (port 8006 is used unless you give one)" autocomplete="off" spellcheck="false">
+        </label>
+        <fieldset>
+          <legend>Proxmox login (required)</legend>
+          <label>Username
+            <input name="username" autocomplete="off" spellcheck="false">
+          </label>
+          <label>Password
+            <input name="password" type="password" autocomplete="new-password">
+            <small id="pve-password-hint" hidden>A password is saved. Leave blank to keep it.</small>
+          </label>
+          <p class="hint">Username as user@realm, e.g. root@pam ("root" alone means root@pam). Accounts with
+            two-factor authentication are not supported. The app only lists VMs and containers and opens their
+            consoles.</p>
+          <p id="cert-row" class="hint" hidden>Pinned certificate (SHA-256): <code id="cert-fp"></code>
+            <button type="button" id="forget-cert" class="link">Forget certificate</button></p>
+        </fieldset>
+      </div>
+      <p id="group-form-error" class="error" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="group-cancel" class="ghost">Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog">
+    <form id="settings-form" method="dialog">
+      <h2>Settings</h2>
+      <label class="check">
+        <input name="restoreTabs" type="checkbox">
+        Reopen the console tabs from last time when the app starts
+      </label>
+      <p id="password-storage" class="hint"></p>
+      <fieldset>
+        <legend>Backup</legend>
+        <p class="hint">Export all devices, groups and their passwords to a file encrypted with a passphrase,
+          for example to move them to another computer. Importing adds the devices from such a file (devices
+          that are already here are updated).</p>
+        <div class="actions">
+          <button type="button" id="export-btn" class="ghost">Export…</button>
+          <button type="button" id="import-btn" class="ghost">Import…</button>
+        </div>
+        <p id="backup-result" class="hint" hidden></p>
+      </fieldset>
+      <p id="settings-error" class="error" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="settings-cancel" class="ghost">Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="find-dialog" class="find">
+    <form id="find-form" method="dialog">
+      <h2>Find devices</h2>
+      <label>Address range
+        <input name="range" placeholder="e.g. 192.168.1.0/24 or 192.168.1.10-192.168.1.60" autocomplete="off" spellcheck="false" required>
+      </label>
+      <p class="hint">A network (a.b.c.d/nn, up to a /20), a range (a.b.c.d-e.f.g.h or a.b.c.d-nn) or single
+        addresses, separated by commas. Only the range you enter is scanned.</p>
+      <div id="find-nets" class="chips" hidden></div>
+      <p id="find-status" class="hint" hidden></p>
+      <p id="find-error" class="error" hidden></p>
+      <ul id="find-results" class="find-results"></ul>
+      <div class="dialog-actions">
+        <button type="button" id="find-close" class="ghost">Close</button>
+        <button type="submit" class="primary" id="find-scan">Scan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="pass-dialog" class="confirm">
+    <form id="pass-form" method="dialog">
+      <h2 id="pass-title"></h2>
+      <p id="pass-msg" class="hint"></p>
+      <label>Passphrase
+        <input name="passphrase" type="password" autocomplete="new-password" required>
+      </label>
+      <label id="pass-confirm-row">Repeat passphrase
+        <input name="confirm" type="password" autocomplete="new-password">
+      </label>
+      <p id="pass-error" class="error" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" id="pass-cancel" class="ghost">Cancel</button>
+        <button type="submit" class="primary" id="pass-ok"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="quick" class="quick" aria-label="Quick connect">
+    <input id="quick-input" type="search" placeholder="Connect to… (name, address, group, VM id)" autocomplete="off" spellcheck="false">
+    <ul id="quick-list" class="quick-list" role="listbox"></ul>
+    <p class="hint quick-hint">Enter: open in a tab · Shift+Enter: open in a new window · Esc: close</p>
   </dialog>
 
   <dialog id="confirm" class="confirm">
@@ -103,7 +232,6 @@
       <div class="card-head">
         <span class="dot" data-status="unknown" title="Checking…"></span>
         <h3 class="name"></h3>
-        <span class="group-tag" hidden></span>
       </div>
       <p class="url"></p>
       <p class="meta"></p>
@@ -119,11 +247,27 @@
     </li>
   </template>
 
+  <template id="group-section">
+    <section class="group-sec">
+      <div class="pve-head">
+        <h2 class="name"></h2>
+        <span class="pve-sub"></span>
+        <span class="spacer"></span>
+        <button class="ghost" data-action="edit">Rename</button>
+        <button class="ghost danger" data-action="delete">Delete</button>
+      </div>
+      <p class="hint group-empty" hidden>No devices in this group yet. Pick it as the Group when you add or
+        edit a device.</p>
+      <ul class="grid"></ul>
+    </section>
+  </template>
+
   <template id="pve-section">
     <section class="pve">
       <div class="pve-head">
         <span class="dot" data-status="unknown"></span>
         <h2 class="name"></h2>
+        <span class="badge">Proxmox</span>
         <span class="pve-sub"></span>
         <span class="spacer"></span>
         <button class="ghost" data-action="refresh" title="Reload the list of VMs and containers">Refresh</button>
@@ -152,6 +296,23 @@
         </button>
       </div>
     </li>
+  </template>
+
+  <template id="tile-tpl">
+    <div class="tile">
+      <div class="tile-head">
+        <span class="dot" data-status="unknown"></span>
+        <span class="tile-name"></span>
+        <span class="spacer"></span>
+        <button class="tab-btn" data-tile-action="solo" title="Show only this console" aria-label="Show only this console">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+        </button>
+        <button class="tab-btn" data-tile-action="remove" title="Remove from the tiled view" aria-label="Remove from the tiled view">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="tile-body">Connecting…</div>
+    </div>
   </template>
 
   <template id="tab">

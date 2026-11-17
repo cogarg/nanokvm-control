@@ -5,6 +5,15 @@
   "permissions": [
     "core:default",
     "allow-list-devices",
+    "allow-get-settings",
+    "allow-save-settings",
+    "allow-export-devices",
+    "allow-import-devices",
+    "allow-local-networks",
+    "allow-discover",
+    "allow-list-groups",
+    "allow-save-group",
+    "allow-delete-group",
     "allow-save-device",
     "allow-delete-device",
     "allow-check-device",
@@ -13,7 +22,7 @@
     "allow-show-tab",
     "allow-close-tab",
     "allow-open-window",
-    "allow-set-console-bounds"
+    "allow-set-layout"
   ],
   "webviews": [
     "ui"
