@@ -49,7 +49,13 @@ function render() {
       node.querySelector('.name').title = d.name;
       node.querySelector('.url').textContent = d.url;
       const meta = node.querySelector('.meta');
-      if (!d.autoLogin) meta.textContent = 'Manual login';
+      if (d.kind === 'supermicro-ikvm') {
+        if (d.username && d.hasPassword) meta.textContent = `Supermicro iKVM · as ${d.username}`;
+        else {
+          meta.textContent = `Supermicro iKVM: the BMC ${d.username ? 'password' : 'username'} is missing`;
+          meta.classList.add('warn');
+        }
+      } else if (!d.autoLogin) meta.textContent = 'Manual login';
       else if (d.username && d.hasPassword) meta.textContent = `Auto-login as ${d.username}`;
       else {
         meta.textContent = `Auto-login is on, but the ${d.username ? 'password' : 'username'} is missing`;
@@ -215,6 +221,27 @@ function confirmDialog(title, message) {
   });
 }
 
+// Default accounts: NanoKVM "admin", Supermicro BMC "ADMIN".
+const DEFAULT_USER = { nanokvm: 'admin', 'supermicro-ikvm': 'ADMIN' };
+
+// The login fields mean slightly different things per device type.
+function applyKind() {
+  const ikvm = fields.kind.value === 'supermicro-ikvm';
+  $('#login-legend').textContent = ikvm ? 'BMC login (required)' : 'Login (optional)';
+  $('#autologin-row').hidden = ikvm;
+  $('#ikvm-hint').hidden = !ikvm;
+  fields.url.placeholder = ikvm ? 'BMC address, e.g. 192.168.1.60' : '192.168.1.50 or https://kvm.lan';
+  fields.username.required = ikvm;
+}
+
+fields.kind.addEventListener('change', () => {
+  // Swap the suggested username if it's still the other type's default.
+  if (!editingId && Object.values(DEFAULT_USER).includes(fields.username.value)) {
+    fields.username.value = DEFAULT_USER[fields.kind.value];
+  }
+  applyKind();
+});
+
 function openDialog(device) {
   editingId = device ? device.id : null;
   clearPassword = false;
@@ -222,14 +249,17 @@ function openDialog(device) {
   showError(formError, '');
   $('#dialog-title').textContent = device ? 'Edit device' : 'Add device';
   if (device) {
+    fields.kind.value = device.kind || 'nanokvm';
     fields.name.value = device.name;
     fields.url.value = device.url;
     fields.username.value = device.username;
     fields.autoLogin.checked = device.autoLogin;
   } else {
-    fields.username.value = 'admin'; // NanoKVM's default account
+    fields.kind.value = 'nanokvm';
+    fields.username.value = DEFAULT_USER.nanokvm;
     fields.autoLogin.checked = true;
   }
+  applyKind();
   passwordHint.hidden = !(device && device.hasPassword);
   dialog.showModal();
   fields.name.focus();
@@ -243,6 +273,7 @@ form.addEventListener('submit', async (ev) => {
     const saved = await invoke('save_device', {
       input: {
         id: editingId,
+        kind: fields.kind.value,
         name: fields.name.value,
         url: fields.url.value,
         username: fields.username.value,

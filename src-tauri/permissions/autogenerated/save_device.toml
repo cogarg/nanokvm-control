@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-device"
+description = "Enables the save_device command without any pre-configured scope."
+commands.allow = ["save_device"]
+
+[[permission]]
+identifier = "deny-save-device"
+description = "Denies the save_device command without any pre-configured scope."
+commands.deny = ["save_device"]

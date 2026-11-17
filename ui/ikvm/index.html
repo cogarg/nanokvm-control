@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iKVM console</title>
+  <link rel="stylesheet" href="console.css">
+</head>
+<body>
+  <header class="bar">
+    <span id="dot" class="dot" data-state="connecting"></span>
+    <span id="status" class="status" role="status">Connecting…</span>
+    <span class="spacer"></span>
+    <button id="wake" title="Press and release Shift. Wakes a console that only redraws after keyboard input.">Wake screen</button>
+    <button id="cad" title="Send Ctrl+Alt+Del to the server">Ctrl+Alt+Del</button>
+    <label class="toggle" title="Watch only: don't send keyboard or mouse input">
+      <input id="viewonly" type="checkbox"> View only
+    </label>
+    <button id="reconnect" class="primary" hidden>Reconnect</button>
+  </header>
+
+  <main id="screen" class="screen">
+    <canvas id="canvas" tabindex="-1"></canvas>
+    <p id="message" class="message">Connecting…</p>
+  </main>
+
+  <dialog id="cad-confirm">
+    <form method="dialog">
+      <h2>Send Ctrl+Alt+Del?</h2>
+      <p>On many servers this reboots the machine immediately (for example at a Linux text console).</p>
+      <div class="actions">
+        <button value="cancel" autofocus>Cancel</button>
+        <button value="ok" class="danger">Send Ctrl+Alt+Del</button>
+      </div>
+    </form>
+  </dialog>
+
+  <footer class="credit">
+    Console client: noVNC (MPL-2.0) with ATEN iKVM support by Kevin Kelley. See README for credits.
+  </footer>
+
+  <!-- noVNC-iKVM core, in the load order its own UI uses (see ../vendor/novnc-ikvm/NOTICE.md). -->
+  <script src="../vendor/novnc-ikvm/core/util.js"></script>
+  <script src="../vendor/novnc-ikvm/core/base64.js"></script>
+  <script src="../vendor/novnc-ikvm/core/websock.js"></script>
+  <script src="../vendor/novnc-ikvm/core/des.js"></script>
+  <script src="../vendor/novnc-ikvm/core/input/keysymdef.js"></script>
+  <script src="../vendor/novnc-ikvm/core/input/xtscancodes.js"></script>
+  <script src="../vendor/novnc-ikvm/core/input/util.js"></script>
+  <script src="../vendor/novnc-ikvm/core/input/devices.js"></script>
+  <script src="../vendor/novnc-ikvm/core/display.js"></script>
+  <script src="../vendor/novnc-ikvm/core/inflator.js"></script>
+  <script src="../vendor/novnc-ikvm/core/rfb.js"></script>
+  <script src="../vendor/novnc-ikvm/core/input/keysym.js"></script>
+  <script src="../vendor/novnc-ikvm/core/ast2100/ast2100const.js"></script>
+  <script src="../vendor/novnc-ikvm/core/ast2100/ast2100util.js"></script>
+  <script src="../vendor/novnc-ikvm/core/ast2100/ast2100idct.js"></script>
+  <script src="../vendor/novnc-ikvm/core/ast2100/ast2100.js"></script>
+  <script src="console.js"></script>
+</body>
+</html>

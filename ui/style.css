@@ -136,10 +136,11 @@ form h2 { margin: 0 0 4px; font-size: 17px; }
 label { display: flex; flex-direction: column; gap: 4px; font-weight: 500; }
 label small { font-weight: 400; color: var(--muted); }
 label.check { flex-direction: row; align-items: center; gap: 8px; font-weight: 400; }
-input:not([type="checkbox"]) {
+input:not([type="checkbox"]), select {
   font: inherit; padding: 8px 10px; border-radius: 8px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }
+.hint { margin: 0; font-size: 12px; color: var(--muted); }
 fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px 14px; margin: 0; display: flex; flex-direction: column; gap: 10px; }
 legend { color: var(--muted); padding: 0 4px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }

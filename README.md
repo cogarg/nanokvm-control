@@ -1,12 +1,17 @@
 # nanokvm-control
 
-Control center for [Sipeed NanoKVM](https://github.com/sipeed/NanoKVM) devices: a small Tauri v2
-desktop app that keeps a list of your NanoKVMs, shows whether each is reachable, and opens their
-consoles in tabs or separate windows, optionally logging you in automatically.
+Control center for [Sipeed NanoKVM](https://github.com/sipeed/NanoKVM) devices and older
+**Supermicro BMCs** (the ones whose remote console is the Java iKVM viewer): a small Tauri v2 desktop
+app that keeps a list of your devices, shows whether each is reachable, and opens their consoles in
+tabs or separate windows, logging you in automatically.
 
 ## Features
 
-- Add / edit / delete devices (name, address, optional credentials)
+- Add / edit / delete devices (type, name, address, credentials)
+- Two device types:
+  - **NanoKVM**: its own web UI is the console
+  - **Supermicro BMC (legacy Java iKVM)**: a built-in browser console replaces the Java viewer, no
+    Java needed (see [Supermicro BMCs](#supermicro-bmcs-legacy-java-ikvm))
 - Online/offline status, polled every 15 s
 - **Connect** opens the device's console in a **tab** of the main window; switch with the tab bar,
   close with × or middle-click
@@ -14,7 +19,8 @@ consoles in tabs or separate windows, optionally logging you in automatically.
   window; Connect on a popped-out device focuses that window instead of opening a duplicate tab
 - Auto-login: the app performs the NanoKVM login from inside the console itself, so the session
   cookie is set exactly as if you had logged in by hand
-- Consoles (tabs and windows) run the remote page with **no** access to the app's IPC
+- Consoles (tabs and windows) have **no** access to the app's commands: only the device-manager UI
+  may call them (enforced with Tauri capabilities; see `src-tauri/build.rs`)
 
 ## Platforms
 
@@ -32,7 +38,7 @@ Runs on **Linux, macOS and Windows**. Each OS uses its own web engine for the co
 - **Linux (Arch/CachyOS):**
   `sudo pacman -S --needed webkit2gtk-4.1 base-devel curl wget file openssl appmenu-gtk-module libappindicator-gtk3 librsvg`
 - **Linux (Debian/Ubuntu):**
-  `sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev build-essential`
+  `sudo apt install libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev libssl-dev build-essential`
 - **macOS:** Xcode Command Line Tools (`xcode-select --install`).
 - **Windows:** Visual Studio Build Tools with the "Desktop development with C++" workload.
 
@@ -71,6 +77,45 @@ Builds are **unsigned**: macOS Gatekeeper will need right-click -> Open the firs
 `xattr -dr com.apple.quarantine "/Applications/NanoKVM Control.app"`), and Windows SmartScreen
 will show "unknown publisher". Signing needs an Apple Developer ID / Windows code-signing certificate.
 
+## Supermicro BMCs (legacy Java iKVM)
+
+Older Supermicro boards (and other boards with an ATEN-made BMC) only offer their remote console
+through a Java Web Start viewer. NanoKVM Control shows that console in a tab instead, using
+[noVNC-iKVM](ui/vendor/novnc-ikvm/NOTICE.md): noVNC with ATEN iKVM support by Kevin Kelley.
+
+Add the BMC with type **Supermicro BMC (legacy Java iKVM)**, its address and a BMC account (default
+`ADMIN`). An address without `http(s)://` is treated as HTTPS.
+
+How a connection works (`src-tauri/src/ikvm.rs`):
+
+1. The console tab loads the bundled page `ui/ikvm/` and connects to a WebSocket relay that the app
+   runs on `127.0.0.1` for that tab (random port and path), because pages can't open raw TCP
+   connections.
+2. For each connection the relay logs in to the BMC's web interface, fetches the Java viewer's
+   launch file to get a one-time iKVM username and password, and connects to the BMC's iKVM port
+   (5900).
+3. The relay writes those one-time credentials into the iKVM login itself: the page only sends
+   placeholders and never sees any credentials.
+4. A few seconds later the relay logs the web session out again (BMCs allow only a few). The
+   console keeps running; **Reconnect** simply repeats the whole sequence.
+
+The console has **Wake screen** (presses Shift, for consoles that only redraw after input),
+**Ctrl+Alt+Del** (asks first: on many servers it reboots immediately) and **View only**.
+
+Notes:
+
+- **Tested on:** an X10-generation board (Xeon E5 v3, Aspeed AST2400) with BMC firmware 3.24.
+  Other ATEN BMCs may or may not work; newer boards (X11 and later) have an HTML5 console and don't
+  need this.
+- **Encryption:** the BMC web login uses HTTPS and accepts the BMC's self-signed certificate.
+  Older firmware only offers TLS 1.2 with CBC ciphers, so these requests use the system TLS
+  library (OpenSSL on Linux) rather than rustls. The iKVM video/keyboard stream itself (port 5900)
+  is **not encrypted**, same as with the Java viewer, so use it on a trusted network.
+- **Not supported:** virtual media (mounting ISOs), and the AST2100 decoder's picture is not quite
+  as sharp as Java's at low quality settings (a known limitation of the decoder).
+- If the account is wrong, the tab says so and nothing is retried: BMCs lock accounts after
+  repeated failed logins.
+
 ## Where data lives
 
 `devices.json` in the app config directory:
@@ -102,6 +147,10 @@ ui/                    device-manager frontend (index.html, style.css, app.js)
 src-tauri/src/main.rs  Tauri commands, console tabs (multi-webview) and windows, auto-login script
 src-tauri/src/stream_watchdog.js  injected into consoles: restarts the MJPEG stream if no picture arrives
 src-tauri/src/store.rs device model + JSON persistence + address normalization
+src-tauri/src/ikvm.rs  Supermicro iKVM: BMC web login, launch-file credentials, WebSocket relay
+src-tauri/build.rs     declares the app's commands, so capabilities can limit them to the UI
+ui/ikvm/               console page for Supermicro iKVM (uses ui/vendor/novnc-ikvm)
+ui/vendor/novnc-ikvm/  third-party noVNC-iKVM client (MPL-2.0), see its NOTICE.md
 src-tauri/src/crypto.rs NanoKVM password encoding (CryptoJS-compatible AES, as the web UI does)
 src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network prompt text
 ```
@@ -123,3 +172,49 @@ src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network pr
   webview positioned under the tab bar; on Linux, where WebKitGTK can't position child webviews,
   the window's webviews are rearranged into a `GtkOverlay` (see `gtk_overlay` in `main.rs`).
   `Cargo.lock` pins Tauri; re-test tabs after upgrading it, as this API may change.
+
+## Credits & licenses
+
+NanoKVM Control is MIT-licensed (see `LICENSE`). It builds on the work of others:
+
+**Bundled third-party code**
+
+- **[noVNC](https://github.com/novnc/noVNC)** by Joel Martin and the noVNC authors:
+  Mozilla Public License 2.0.
+- **ATEN iKVM support for noVNC** (ATEN login, keyboard/mouse messages, AST2100 video decoder) by
+  **Kevin Kelley**, from the `bmc-support` branch of
+  [kelleyk/noVNC](https://github.com/kelleyk/noVNC). Its ATEN handling credits
+  [chicken-aten-ikvm](https://github.com/thefloweringash/chicken-aten-ikvm) by thefloweringash.
+- **[pako](https://github.com/nodeca/pako)** by Vitaly Puzrin (inside noVNC's `inflator.js`): MIT.
+- noVNC's `des.js` carries notices from AT&T Laboratories Cambridge and Widget Workshop.
+
+These live in `ui/vendor/novnc-ikvm/` with their license texts and a
+[NOTICE.md](ui/vendor/novnc-ikvm/NOTICE.md) describing the exact source, the one change made for
+this app, and a note on the AST2100 decoder files (they carry a copyright notice but no license
+line of their own and are used under the repository's default MPL-2.0).
+
+**Libraries** (compiled in, not modified)
+
+| Library | License |
+|---|---|
+| [Tauri](https://github.com/tauri-apps/tauri), wry, tao | Apache-2.0 / MIT |
+| [webkit2gtk-rs](https://github.com/tauri-apps/webkit2gtk-rs), [gtk-rs](https://github.com/gtk-rs/gtk3-rs) (Linux) | MIT |
+| [reqwest](https://github.com/seanmonstar/reqwest), [hyper](https://github.com/hyperium/hyper) | MIT / Apache-2.0, MIT |
+| [rustls](https://github.com/rustls/rustls) | Apache-2.0 / ISC / MIT |
+| [rust-native-tls](https://github.com/sfackler/rust-native-tls), [rust-openssl](https://github.com/sfackler/rust-openssl) (with the system's [OpenSSL](https://www.openssl.org/) on Linux) | MIT / Apache-2.0, Apache-2.0 |
+| [tokio](https://github.com/tokio-rs/tokio), [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) | MIT |
+| [futures-rs](https://github.com/rust-lang/futures-rs) | MIT / Apache-2.0 |
+| [serde](https://github.com/serde-rs/serde), [serde_json](https://github.com/serde-rs/json) | MIT / Apache-2.0 |
+| [RustCrypto](https://github.com/RustCrypto) `aes`, `cbc`, `md-5` | MIT / Apache-2.0 |
+| [rand](https://github.com/rust-random/rand), [uuid](https://github.com/uuid-rs/uuid), [base64](https://github.com/marshallpierce/rust-base64) | MIT / Apache-2.0 |
+| [urlencoding](https://github.com/kornelski/rust_urlencoding) | MIT |
+
+The full dependency tree and each crate's license can be listed with
+`cargo metadata` or [`cargo-about`](https://github.com/EmbarkStudios/cargo-about).
+
+**Protocols and devices**
+
+- [Sipeed NanoKVM](https://github.com/sipeed/NanoKVM): the login protocol (including its
+  CryptoJS-style password encryption) follows the NanoKVM web UI's own code.
+- Supermicro/ATEN iKVM: reverse-engineered by the projects above; Supermicro and ATEN aren't
+  affiliated with this app.

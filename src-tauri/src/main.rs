@@ -1,11 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod crypto;
+mod ikvm;
 mod store;
 
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Mutex, time::Duration};
-use store::{Device, DeviceInput, DeviceView, Store};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex, time::Duration};
+use store::{Device, DeviceInput, DeviceKind, DeviceView, Store};
 use tauri::{
     webview::WebviewBuilder, window::WindowBuilder, AppHandle, LogicalPosition, LogicalSize, Manager, Rect,
     State, Url, WebviewUrl, WebviewWindowBuilder,
@@ -38,6 +39,10 @@ impl ConsoleBounds {
 struct AppState {
     store: Mutex<Store>,
     http: reqwest::Client,
+    /// For BMC web UIs (longer timeout, no redirects).
+    bmc_http: reqwest::Client,
+    /// iKVM relays of open Supermicro consoles, by webview/window label.
+    relays: Mutex<HashMap<String, ikvm::Relay>>,
     bounds: Mutex<ConsoleBounds>,
     /// Webview data directory (cookies, storage) when isolated; `None` uses the platform default.
     webview_data: Option<PathBuf>,
@@ -245,6 +250,43 @@ fn console_url(d: &Device) -> Result<WebviewUrl, String> {
     Ok(WebviewUrl::External(Url::parse(&d.url).map_err(|e| e.to_string())?))
 }
 
+/// What a console webview loads and which scripts it gets, per device kind.
+struct ConsoleSpec {
+    url: WebviewUrl,
+    scripts: Vec<String>,
+}
+
+/// NanoKVM: its own web UI, plus auto-login and the stream watchdog. Supermicro: the bundled
+/// noVNC-iKVM page (ui/ikvm), talking to a relay started for this console (`label`).
+async fn console_spec(state: &AppState, d: &Device, label: &str) -> Result<ConsoleSpec, String> {
+    match d.kind {
+        DeviceKind::Nanokvm => Ok(ConsoleSpec {
+            url: console_url(d)?,
+            scripts: [autologin_script(d), stream_watchdog_script(d)].into_iter().flatten().collect(),
+        }),
+        DeviceKind::SupermicroIkvm => {
+            if d.username.is_empty() || d.password.is_empty() {
+                return Err("Save the BMC username and password first (Edit)".into());
+            }
+            let url = Url::parse(&d.url).map_err(|e| e.to_string())?;
+            let host = url.host_str().ok_or("The address has no host")?.to_string();
+            let bmc = ikvm::Bmc { base: d.url.clone(), username: d.username.clone(), password: d.password.clone() };
+            let relay = ikvm::start_relay(state.bmc_http.clone(), bmc, host).await?;
+            let config = serde_json::json!({ "port": relay.port, "token": relay.token, "name": d.name });
+            state.relays.lock().unwrap().insert(label.to_string(), relay);
+            Ok(ConsoleSpec {
+                url: WebviewUrl::App("ikvm/index.html".into()),
+                scripts: vec![format!("window.__NKC_IKVM = {config};")],
+            })
+        }
+    }
+}
+
+/// Stops the iKVM relay of a console, if it had one.
+fn stop_relay(app: &AppHandle, label: &str) {
+    app.state::<AppState>().relays.lock().unwrap().remove(label);
+}
+
 fn focus_window(app: &AppHandle, label: &str) -> bool {
     match app.get_webview_window(label) {
         Some(w) => {
@@ -282,6 +324,7 @@ fn close_tab_webview(app: &AppHandle, id: &str) {
     if let Some(w) = app.get_webview(&tab_label(id)) {
         let _ = w.close();
     }
+    stop_relay(app, &tab_label(id));
 }
 
 // ---------------------------------------------------------------- device store
@@ -302,14 +345,21 @@ fn delete_device(app: AppHandle, state: State<AppState>, id: String) -> Result<(
     if let Some(w) = app.get_webview_window(&window_label(&id)) {
         let _ = w.close();
     }
+    stop_relay(&app, &window_label(&id));
     state.store.lock().unwrap().delete(&id)
 }
 
 /// Reachability check: any HTTP response from the device counts as online.
 #[tauri::command]
 async fn check_device(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    let url = device(&state, &id)?.url;
-    Ok(state.http.get(url).send().await.is_ok())
+    let d = device(&state, &id)?;
+    let http = match d.kind {
+        DeviceKind::Nanokvm => &state.http,
+        // Older BMCs need the system TLS library (see ikvm::http_client); keep the short timeout.
+        DeviceKind::SupermicroIkvm => &state.bmc_http,
+    };
+    let check = http.get(&d.url).send();
+    Ok(matches!(tokio::time::timeout(Duration::from_secs(4), check).await, Ok(Ok(_))))
 }
 
 // ---------------------------------------------------------------- consoles
@@ -325,20 +375,23 @@ async fn open_tab(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
         let d = device(&state, &id)?;
         let window = app.get_window(MAIN_WINDOW).ok_or("Main window is gone")?;
         let bounds = *state.bounds.lock().unwrap();
-        let mut builder = WebviewBuilder::new(tab_label(&id), console_url(&d)?);
+        let label = tab_label(&id);
+        let spec = console_spec(&state, &d, &label).await?;
+        let mut builder = WebviewBuilder::new(&label, spec.url);
         if let Some(dir) = &state.webview_data {
             builder = builder.data_directory(dir.clone());
         }
-        if let Some(script) = autologin_script(&d) {
-            builder = builder.initialization_script(script);
-        }
-        if let Some(script) = stream_watchdog_script(&d) {
+        for script in spec.scripts {
             builder = builder.initialization_script(script);
         }
         let rect = bounds.rect();
-        let webview = window
-            .add_child(builder, rect.position, rect.size)
-            .map_err(|e| format!("Could not open console: {e}"))?;
+        let webview = match window.add_child(builder, rect.position, rect.size) {
+            Ok(w) => w,
+            Err(e) => {
+                stop_relay(&app, &label);
+                return Err(format!("Could not open console: {e}"));
+            }
+        };
         #[cfg(target_os = "linux")]
         {
             let top = bounds.y.round() as i32;
@@ -375,20 +428,34 @@ async fn open_window(app: AppHandle, state: State<'_, AppState>, id: String) -> 
         return Ok(());
     }
     let d = device(&state, &id)?;
-    let mut builder = WebviewWindowBuilder::new(&app, &label, console_url(&d)?)
-        .title(format!("{} — NanoKVM", d.name))
+    let spec = console_spec(&state, &d, &label).await?;
+    let suffix = match d.kind {
+        DeviceKind::Nanokvm => "NanoKVM",
+        DeviceKind::SupermicroIkvm => "iKVM",
+    };
+    let mut builder = WebviewWindowBuilder::new(&app, &label, spec.url)
+        .title(format!("{} — {suffix}", d.name))
         .inner_size(1280.0, 800.0)
         .min_inner_size(640.0, 400.0);
     if let Some(dir) = &state.webview_data {
         builder = builder.data_directory(dir.clone());
     }
-    if let Some(script) = autologin_script(&d) {
+    for script in spec.scripts {
         builder = builder.initialization_script(script);
     }
-    if let Some(script) = stream_watchdog_script(&d) {
-        builder = builder.initialization_script(script);
-    }
-    let window = builder.build().map_err(|e| format!("Could not open console window: {e}"))?;
+    let window = match builder.build() {
+        Ok(w) => w,
+        Err(e) => {
+            stop_relay(&app, &label);
+            return Err(format!("Could not open console window: {e}"));
+        }
+    };
+    let (handle, closed_label) = (app.clone(), label.clone());
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            stop_relay(&handle, &closed_label);
+        }
+    });
     #[cfg(target_os = "linux")]
     let _ = window.with_webview(|p| disable_disk_cache(&p.inner()));
     #[cfg(not(target_os = "linux"))]
@@ -417,6 +484,7 @@ fn main() {
         .setup(|app| {
             let location = data_location(app)?;
             let http = reqwest::Client::builder()
+                .use_rustls_tls()
                 .timeout(Duration::from_secs(3))
                 // NanoKVM's optional HTTPS mode uses a self-signed certificate.
                 .danger_accept_invalid_certs(true)
@@ -424,6 +492,8 @@ fn main() {
             app.manage(AppState {
                 store: Mutex::new(Store::load(location.devices_file)),
                 http,
+                bmc_http: ikvm::http_client()?,
+                relays: Mutex::new(HashMap::new()),
                 bounds: Mutex::new(ConsoleBounds { x: 0.0, y: 44.0, width: 1280.0, height: 776.0 }),
                 webview_data: location.webview_data.clone(),
             });

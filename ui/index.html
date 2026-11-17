@@ -37,6 +37,12 @@
   <dialog id="dialog">
     <form id="form" method="dialog">
       <h2 id="dialog-title">Add device</h2>
+      <label>Type
+        <select name="kind">
+          <option value="nanokvm">NanoKVM</option>
+          <option value="supermicro-ikvm">Supermicro BMC (legacy Java iKVM)</option>
+        </select>
+      </label>
       <label>Name
         <input name="name" required placeholder="Rack server" autocomplete="off">
       </label>
@@ -44,7 +50,7 @@
         <input name="url" required placeholder="192.168.1.50 or https://kvm.lan" autocomplete="off" spellcheck="false">
       </label>
       <fieldset>
-        <legend>Login (optional)</legend>
+        <legend id="login-legend">Login (optional)</legend>
         <label>Username
           <input name="username" autocomplete="off" spellcheck="false">
         </label>
@@ -53,10 +59,12 @@
           <small id="password-hint" hidden>A password is saved. Leave blank to keep it.
             <button type="button" id="clear-password" class="link">Forget it</button></small>
         </label>
-        <label class="check">
+        <label class="check" id="autologin-row">
           <input name="autoLogin" type="checkbox">
           Log in automatically when connecting
         </label>
+        <p id="ikvm-hint" class="hint" hidden>The app logs in to the BMC's web interface with this
+          account each time you connect, to start the iKVM console.</p>
       </fieldset>
       <p id="form-error" class="error" hidden></p>
       <div class="dialog-actions">

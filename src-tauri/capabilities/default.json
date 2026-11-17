@@ -1,9 +1,18 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "IPC access for the device-manager UI webview only. KVM console tabs/windows load remote pages and get no IPC access.",
+  "description": "IPC access for the device-manager UI webview only. Console tabs/windows (remote NanoKVM pages, and the bundled iKVM page) get no IPC access.",
   "permissions": [
-    "core:default"
+    "core:default",
+    "allow-list-devices",
+    "allow-save-device",
+    "allow-delete-device",
+    "allow-check-device",
+    "allow-open-tab",
+    "allow-show-tab",
+    "allow-close-tab",
+    "allow-open-window",
+    "allow-set-console-bounds"
   ],
   "webviews": [
     "ui"
