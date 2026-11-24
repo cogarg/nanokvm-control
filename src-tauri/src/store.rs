@@ -180,6 +180,10 @@ pub struct Settings {
     pub open_tabs: Vec<String>,
     #[serde(default)]
     pub active_tab: Option<String>,
+    /// Linux: start WebKit without its DMA-BUF renderer (`WEBKIT_DISABLE_DMABUF_RENDERER=1`), a
+    /// workaround for GPU driver problems. Read once at startup, before any webview exists.
+    #[serde(default)]
+    pub compat_renderer: bool,
 }
 
 pub fn load_settings(devices_file: &PathBuf) -> Settings {
@@ -552,7 +556,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_url, Device, DeviceInput, DeviceKind, GroupInput, Store};
+    use super::{load_settings, normalize_url, save_settings, Device, DeviceInput, DeviceKind, GroupInput, Settings, Store};
     use crate::secrets::{Memory, Secrets};
     use std::sync::Arc;
 
@@ -750,5 +754,22 @@ mod tests {
         assert_eq!(other.import(store.export_contents()).unwrap(), (0, 1, 0));
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn keeps_the_renderer_setting_without_tab_restore() {
+        let (dir, path) = temp_store_file("[]");
+        assert!(!load_settings(&path).compat_renderer);
+        let settings = Settings {
+            restore_tabs: false,
+            open_tabs: vec!["a".into()],
+            active_tab: Some("a".into()),
+            compat_renderer: true,
+        };
+        save_settings(&path, &settings).unwrap();
+        let back = load_settings(&path);
+        assert!(back.compat_renderer);
+        assert!(back.open_tabs.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

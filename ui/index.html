@@ -153,6 +153,16 @@
         <input name="restoreTabs" type="checkbox">
         Reopen the console tabs from last time when the app starts
       </label>
+      <div id="renderer-row" class="setting" hidden>
+        <label class="check">
+          <input name="compatRenderer" type="checkbox">
+          Use the compatibility renderer
+        </label>
+        <p class="hint">Draws the app and consoles without sharing GPU buffers between WebKit's processes
+          (WEBKIT_DISABLE_DMABUF_RENDERER). Try this if the app crashes, or consoles flicker or stay blank,
+          with your graphics driver. It can use a little more CPU.</p>
+        <p id="renderer-note" class="hint" hidden></p>
+      </div>
       <p id="password-storage" class="hint"></p>
       <fieldset>
         <legend>Backup</legend>

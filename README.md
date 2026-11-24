@@ -34,6 +34,7 @@ is reachable, and opens their consoles in tabs or separate windows, logging you 
 - **Tiled view:** the tile button in the tab bar shows up to 4 open consoles side by side; clicking
   another tab adds it, each tile can be shown alone or removed
 - **Reopen tabs** from the last session at startup (off unless turned on in **Settings**)
+- **Compatibility renderer** (Linux, in **Settings**) for graphics drivers that misbehave with WebKit
 - Online/offline status, polled every 15 s
 - **Connect** opens the device's console in a **tab** of the main window; switch with the tab bar,
   close with × or middle-click
@@ -281,8 +282,10 @@ src-tauri/Info.plist   macOS: allow plain-HTTP consoles (ATS) + Local Network pr
   On Linux and Windows the certificate is pinned on first contact. Within one app session, a
   certificate accepted for a host applies to every console of that host.
 - **Video (Linux):** the console uses the system WebKitGTK. If H.264/WebRTC mode doesn't play, switch the
-  NanoKVM to MJPEG mode in its settings. On NVIDIA, a blank window may need
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1`.
+  NanoKVM to MJPEG mode in its settings. If the app crashes after running for a while, or windows
+  stay blank or flicker (seen with some NVIDIA and Mesa drivers), turn on **Settings → Use the
+  compatibility renderer** and restart the app. It starts WebKit with
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1`; setting that variable yourself works too and takes precedence.
 - **Black console, working mouse (WebKit, MJPEG mode):** WebKit learns that the console page loads
   the never-ending `/api/stream/mjpeg` and starts fetching it speculatively on later visits; the
   page's own request then waits forever, and reloading doesn't help. The app turns off WebKitGTK's

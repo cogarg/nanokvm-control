@@ -853,7 +853,9 @@ function saveSession() {
   if (!settings.restoreTabs || restoring) return;
   clearTimeout(sessionTimer);
   sessionTimer = setTimeout(() => {
-    invoke('save_settings', { settings: { restoreTabs: true, openTabs: tabs, activeTab: active } }).catch(() => {});
+    invoke('save_settings', {
+      settings: { restoreTabs: true, openTabs: tabs, activeTab: active, compatRenderer: !!settings.compatRenderer },
+    }).catch(() => {});
   }, 300);
 }
 
@@ -878,15 +880,36 @@ $('#settings-btn').addEventListener('click', async () => {
     settings.passwordStorage === 'keychain'
       ? 'Passwords are stored in the system keychain.'
       : 'No system keychain is available, so passwords are stored in the device file (readable only by your user).';
+  $('#renderer-row').hidden = !settings.rendererOption;
+  settingsForm.elements.compatRenderer.checked = !!settings.compatRenderer;
+  updateRendererNote();
   settingsDialog.showModal();
 });
+// The renderer is chosen at startup, so say when the choice differs from what is running.
+function updateRendererNote() {
+  const wanted = settingsForm.elements.compatRenderer.checked;
+  const note = $('#renderer-note');
+  let text = '';
+  if (settings.compatRendererActive && !settings.compatRenderer && !wanted) {
+    text = 'It is on right now because WEBKIT_DISABLE_DMABUF_RENDERER is set in the environment.';
+  } else if (wanted !== !!settings.compatRendererActive) {
+    text = 'Takes effect when you restart the app.';
+  }
+  note.textContent = text;
+  note.hidden = !text;
+}
+settingsForm.elements.compatRenderer.addEventListener('change', updateRendererNote);
 $('#settings-cancel').addEventListener('click', () => settingsDialog.close());
 settingsForm.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const restoreTabs = settingsForm.elements.restoreTabs.checked;
+  const compatRenderer = settingsForm.elements.compatRenderer.checked;
   try {
-    await invoke('save_settings', { settings: { restoreTabs, openTabs: restoreTabs ? tabs : [], activeTab: restoreTabs ? active : null } });
+    await invoke('save_settings', {
+      settings: { restoreTabs, openTabs: restoreTabs ? tabs : [], activeTab: restoreTabs ? active : null, compatRenderer },
+    });
     settings.restoreTabs = restoreTabs;
+    settings.compatRenderer = compatRenderer;
     settingsDialog.close();
   } catch (e) {
     showError($('#settings-error'), String(e));

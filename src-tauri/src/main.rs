@@ -83,7 +83,10 @@ struct DataLocation {
 }
 
 fn data_location(app: &tauri::App) -> tauri::Result<DataLocation> {
-    let config_dir = app.path().app_config_dir()?;
+    Ok(data_location_in(app.path().app_config_dir()?))
+}
+
+fn data_location_in(config_dir: PathBuf) -> DataLocation {
     let root = match std::env::var_os(DATA_DIR_ENV).filter(|v| !v.is_empty()) {
         Some(dir) => Some(PathBuf::from(dir)),
         None if cfg!(debug_assertions) => {
@@ -93,7 +96,7 @@ fn data_location(app: &tauri::App) -> tauri::Result<DataLocation> {
         }
         None => None,
     };
-    Ok(match root {
+    match root {
         Some(root) => DataLocation {
             devices_file: root.join("devices.json"),
             webview_data: Some(root.join("webview")),
@@ -104,7 +107,39 @@ fn data_location(app: &tauri::App) -> tauri::Result<DataLocation> {
             webview_data: None,
             isolated_root: None,
         },
-    })
+    }
+}
+
+/// Whether WebKit runs without its DMA-BUF renderer in this process (Linux).
+static COMPAT_RENDERER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Linux: applies the "compatibility renderer" setting. WebKit reads the variable when it starts,
+/// so this has to run before Tauri creates anything; the settings file is found the same way
+/// Tauri's `app_config_dir` does (`$XDG_CONFIG_HOME` or `~/.config`, plus the app identifier).
+/// A variable already set by the user wins.
+#[cfg(target_os = "linux")]
+fn apply_renderer_setting() {
+    const VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    let active = match std::env::var_os(VAR) {
+        // WebKit treats any value except "0" as set.
+        Some(v) => v != "0",
+        None => {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+            let wanted = config_home.is_some_and(|dir| {
+                let location = data_location_in(dir.join("io.github.cogarg.nanokvm-control"));
+                store::load_settings(&location.devices_file).compat_renderer
+            });
+            if wanted {
+                // Still single-threaded here.
+                std::env::set_var(VAR, "1");
+            }
+            wanted
+        }
+    };
+    COMPAT_RENDERER.store(active, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Where a device's console ended up after a connect request.
@@ -579,12 +614,21 @@ struct SettingsView {
     #[serde(flatten)]
     settings: store::Settings,
     password_storage: &'static str,
+    /// The renderer option exists on this platform (Linux).
+    renderer_option: bool,
+    /// The compatibility renderer is in use right now (it changes only on restart).
+    compat_renderer_active: bool,
 }
 
 #[tauri::command]
 fn get_settings(state: State<AppState>) -> SettingsView {
     let store = state.store.lock().unwrap();
-    SettingsView { settings: store::load_settings(store.path()), password_storage: store.password_storage() }
+    SettingsView {
+        settings: store::load_settings(store.path()),
+        password_storage: store.password_storage(),
+        renderer_option: cfg!(target_os = "linux"),
+        compat_renderer_active: COMPAT_RENDERER.load(std::sync::atomic::Ordering::Relaxed),
+    }
 }
 
 /// Saves the settings; open tabs are only remembered while "reopen tabs" is on.
@@ -944,6 +988,8 @@ fn set_layout(app: AppHandle, state: State<AppState>, area: ConsoleBounds, tiles
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    apply_renderer_setting();
     tauri::Builder::default()
         // File pickers for export/import, used from Rust only (the UI gets no dialog permissions).
         .plugin(tauri_plugin_dialog::init())

@@ -149,6 +149,8 @@ input:not([type="checkbox"]), select {
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }
 .hint { margin: 0; font-size: 12px; color: var(--muted); }
+.setting { display: flex; flex-direction: column; gap: 4px; }
+.setting[hidden] { display: none; }
 fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px 14px; margin: 0; display: flex; flex-direction: column; gap: 10px; }
 legend { color: var(--muted); padding: 0 4px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
